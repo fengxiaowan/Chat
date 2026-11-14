@@ -17,10 +17,14 @@ const BASE = '/liao'
 const DATA_URL = new URL('./data/', import.meta.url)
 const THREADS_URL = new URL('./threads/', DATA_URL)
 const CURRENT_URL = new URL('current.json', DATA_URL)
+const MEMORY_URL = new URL('./memory/', DATA_URL)
+const EPISODES_URL = new URL('episodes.json', MEMORY_URL)
 
 const FALLBACK_PROMPT = `你是一个普通人，正用手机跟朋友聊天。一次只回一两句，十到四十个字，像打字。不是助手，不给建议，不总结。\n\n{memory}`
 
 const FALLBACK_NOTES = `整理下面这段闲聊里值得长期记住的东西，只输出 JSON：{"about_you": [], "how_to_talk": [], "between_us": [], "about_me": []}`
+
+const FALLBACK_EPISODES = `把下面这段聊天压缩成几条"事件卡"，只输出 JSON 数组：[{"theme":"","content":"","mood":""}]`
 
 const DEFAULT_TUNE = {
   maxBubbles: 4,
@@ -50,10 +54,22 @@ function notesText() {
   try { return read('notes.md') } catch { return FALLBACK_NOTES }
 }
 
+function episodesText() {
+  try { return read('episodes.md') } catch { return FALLBACK_EPISODES }
+}
+
 const FIELDS = ['about_you', 'how_to_talk', 'between_us', 'about_me']
 const MAX_NOTES = 8
+// 分层记忆 / 事件卡参数
+const EPISODE_BATCH = 20        // 每累计约 10 轮(20 条)消息，批量压一次事件卡
+const EPISODE_WINDOW = 40       // 每段（每次 LLM 调用）压缩的消息条数
+const EPISODE_BACKFILL_MAX = 30 // 单次后台最多压多少段，防历史太长一次跑不完
+const MAX_EPISODES = 200        // 事件卡超过该数量时，把最旧一批并进滚动摘要
+const RECALL_K = 4             // 每轮主动回忆最多注入几条
+const RECALL_THRESHOLD = 0.28  // 相关分低于此值就不注入，省 token
+const MAX_SUMMARY = 160        // 滚动摘要最长字符
 const HARD = new Set(Array.from('。！？!?…\n'))
-const SOFT = new Set(Array.from('，,；;、：: '))
+const SOFT = new Set(Array.from('，,；;、：:'))
 
 // ---------- 落盘 ----------
 
@@ -230,9 +246,13 @@ function memoryBlock(notes) {
   return lines.length ? lines.join('\n') : '（还什么都没记住，正常聊就行）'
 }
 
-function buildSystem(notes) {
+function buildSystem(notes, recallText, backText, factsText) {
   const base = promptText().replace('{memory}', memoryBlock(notes))
-  return base + `\n\n现在是 ${formatNow()}（北京时间）。这是系统提供的准确时间，可信。`
+  let out = base + `\n\n现在是 ${formatNow()}（北京时间）。这是系统提供的准确时间，可信。`
+  if (factsText) out += `\n\n${factsText}`
+  if (recallText) out += `\n\n【下面是之前聊到、可能相关的旧事，自然就带一句，别生硬提】\n${recallText}`
+  if (backText) out += `\n\n${backText}`
+  return out
 }
 
 function pad(n) { return String(n).padStart(2, '0') }
@@ -272,6 +292,224 @@ function parseJson(text) {
   const j = t.lastIndexOf('}')
   if (i < 0 || j <= i) throw new Error('no json')
   return JSON.parse(t.slice(i, j + 1))
+}
+
+// ---------- 分层记忆：事件卡 + 主动回忆 ----------
+
+function loadMemory() {
+  const d = readJsonUrl(EPISODES_URL, null)
+  if (d && typeof d === 'object') {
+    return {
+      cursor: d.cursor && typeof d.cursor === 'object' ? d.cursor : {},
+      episodes: Array.isArray(d.episodes) ? d.episodes : [],
+      summary: typeof d.summary === 'string' ? d.summary : '',
+    }
+  }
+  return { cursor: {}, episodes: [], summary: '' }
+}
+
+function writeMemory(mem) {
+  try { mkdirSync(MEMORY_URL, { recursive: true }) } catch {}
+  writeJsonUrl(EPISODES_URL, mem)
+}
+
+function parseEpisodes(text) {
+  let t = String(text || '').trim()
+  if (t.startsWith('```')) t = t.replace(/^```[a-zA-Z]*\s*/, '').replace(/\s*```$/, '')
+  const i = t.indexOf('[')
+  const j = t.lastIndexOf(']')
+  if (i < 0 || j <= i) return []
+  let arr
+  try { arr = JSON.parse(t.slice(i, j + 1)) } catch { return [] }
+  if (!Array.isArray(arr)) return []
+  const now = Date.now()
+  return arr
+    .filter((e) => e && typeof e === 'object')
+    .map((e, k) => ({
+      id: 'e-' + now + '-' + k + '-' + Math.random().toString(36).slice(2, 6),
+      ts: new Date().toISOString(),
+      theme: String(e.theme || '').trim().slice(0, 24),
+      content: String(e.content || '').trim().slice(0, 60),
+      mood: String(e.mood || '').trim().slice(0, 12),
+      keywords: (Array.isArray(e.keywords) ? e.keywords : [])
+        .map((s) => String(s || '').trim())
+        .filter((s) => s && s.length <= 20)
+        .slice(0, 6),
+    }))
+    .filter((e) => e.theme || e.content)
+}
+
+function rollSummary(mem) {
+  const eps = mem.episodes || []
+  if (eps.length <= MAX_EPISODES) return
+  const overflow = eps.length - MAX_EPISODES
+  const old = eps.slice(0, overflow)
+  mem.episodes = eps.slice(overflow)
+  const themes = old.map((e) => e.theme).filter(Boolean)
+  if (themes.length) {
+    const line = '前期：' + themes.join('、')
+    mem.summary = (((mem.summary || '') + '；' + line).replace(/^；/, '')).slice(-MAX_SUMMARY)
+  }
+}
+
+let episodeBusy = false
+
+async function maybeGenerateEpisodes(ctx, threadId, messages) {
+  if (episodeBusy) return
+  const key = threadId || 'default'
+  const mem0 = loadMemory()
+  let cur = mem0.cursor[key] || 0
+  if (messages.length - cur < EPISODE_BATCH) return
+  episodeBusy = true
+  try {
+    // 从上次进度起逐段压缩，直到把现有消息全部压成事件卡（含历史回填）
+    let chunks = 0
+    while (messages.length - cur >= EPISODE_BATCH && chunks < EPISODE_BACKFILL_MAX) {
+      const chunk = messages.slice(cur, cur + EPISODE_WINDOW)
+      if (!chunk.length) break
+      const eps = await compressEpisodes(ctx, chunk)
+      cur += chunk.length
+      const m2 = loadMemory()
+      m2.cursor[key] = cur
+      if (eps.length) m2.episodes = (m2.episodes || []).concat(eps)
+      rollSummary(m2)
+      writeMemory(m2)
+      chunks += 1
+    }
+  } catch {} finally {
+    episodeBusy = false
+  }
+}
+
+async function compressEpisodes(ctx, messages) {
+  const { provider, model } = selection(ctx, tune())
+  const lines = messages.map((m) => {
+    const role = m.role === 'user' ? '对方' : '你'
+    const ts = formatTs(m.ts)
+    return ts ? `[${ts}] ${role}：${m.content}` : `${role}：${m.content}`
+  })
+  let text = ''
+  for await (const chunk of ctx.llm.stream({
+    provider,
+    model,
+    system: episodesText(),
+    messages: [{ role: 'user', content: [{ type: 'text', text: lines.join('\n') }] }],
+    temperature: 0.3,
+    maxTokens: 2000,
+    reasoningEffort: 'low',
+  })) {
+    if (isText(chunk)) text += chunk.text
+  }
+  if (!text.trim()) throw new Error('episode stream empty')
+  return parseEpisodes(text)
+}
+
+function bigrams(s) {
+  const clean = String(s || '').toLowerCase().replace(/[^\u4e00-\u9fa5a-z0-9]/g, '')
+  const set = new Set()
+  for (let i = 0; i < clean.length - 1; i++) set.add(clean.slice(i, i + 2))
+  return set
+}
+
+function recallEpisodes(query, mem) {
+  const eps = mem.episodes || []
+  if (!eps.length || !query || !String(query).trim()) return []
+  const q = bigrams(query)
+  const ql = String(query).toLowerCase()
+  const scored = []
+  for (const e of eps) {
+    const ageDays = e.ts ? Math.max(0, (Date.now() - new Date(e.ts).getTime()) / 86400000) : 365
+    const decay = Math.max(0, 1 - ageDays / 30)
+    // 1) 关键词命中：强信号（解决「推箱子」→「沉星之序」这类无共同字的情况）
+    let kwHit = 0
+    for (const kw of e.keywords || []) {
+      const k = String(kw).toLowerCase()
+      if (k && (ql.includes(k) || k.includes(ql))) kwHit++
+    }
+    let score = 0
+    if (kwHit > 0) {
+      score = 0.8 + 0.06 * Math.min(kwHit, 3) + decay * 0.1
+    } else if (q.size) {
+      // 2) bigram 重叠：弱信号兜底
+      const t = bigrams((e.theme || '') + ' ' + (e.content || ''))
+      let hit = 0
+      if (t.size) for (const b of q) if (t.has(b)) hit++
+      if (hit > 0) score = (hit / q.size) * 0.75 + decay * 0.25
+    }
+    if (score >= RECALL_THRESHOLD) scored.push({ e, score })
+  }
+  scored.sort((a, b) => b.score - a.score)
+  return scored.slice(0, RECALL_K).map((s) => s.e)
+}
+
+function recallBlock(eps, summary) {
+  if (eps.length) {
+    return eps.map((e) => {
+      const ts = formatTs(e.ts)
+      const when = ts ? `（${ts}）` : ''
+      return `· ${e.theme}${when}：${e.content}${e.mood ? `（${e.mood}）` : ''}`
+    }).join('\n')
+  }
+  return summary ? '更早以前：' + summary : ''
+}
+
+// ---------- 事实层：把事件卡的关键词确定性地注入，不依赖 LLM 提取 ----------
+
+function factsBlock() {
+  const mem = loadMemory()
+  const kws = new Set()
+  for (const e of mem.episodes || []) {
+    for (const kw of e.keywords || []) {
+      const k = String(kw).trim()
+      if (k.length >= 2 && k.length <= 24) kws.add(k)
+    }
+  }
+  if (!kws.size) return ''
+  return '【对方提过这些名字/作品/关键词，可能被问起】\n' + [...kws].slice(0, 40).join('、')
+}
+
+// ---------- 原文回溯：事件卡/notes 没兜住时，去全文里 grep ----------
+
+function queryGrams(query) {
+  const c = String(query || '').replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '')
+  const grams = []
+  for (let n = 3; n >= 2; n--) {
+    for (let i = 0; i + n <= c.length; i++) grams.push(c.slice(i, i + n))
+  }
+  return grams
+}
+
+function backtrackBlock(full, query) {
+  if (!query || !String(query).trim()) return ''
+  const grams = queryGrams(query)
+  if (!grams.length) return ''
+  const msgs = Array.isArray(full) ? full : []
+  const target = msgs.slice(0, -1) // 排除当前这条用户消息本身
+  if (!target.length) return ''
+  const minHits = grams.length <= 4 ? 1 : 2
+  const WINDOW = 5
+  const scored = []
+  for (let i = 0; i < target.length; i++) {
+    const c = target[i].content || ''
+    if (!c) continue
+    let hits = 0
+    for (const g of grams) if (c.includes(g)) hits++
+    if (hits >= minHits) scored.push({ i, hits })
+  }
+  if (!scored.length) return ''
+  scored.sort((a, b) => b.hits - a.hits)
+  const top = scored.slice(0, 3).map((s) => s.i).sort((a, b) => a - b)
+  const idx = new Set()
+  for (const i of top) {
+    for (let j = Math.max(0, i - WINDOW); j <= Math.min(target.length - 1, i + WINDOW); j++) idx.add(j)
+  }
+  const lines = [...idx].sort((a, b) => a - b).map((i) => {
+    const m = target[i]
+    const role = m.role === 'user' ? '对方' : '你'
+    const ts = formatTs(m.ts)
+    return ts ? `[${ts}] ${role}：${m.content}` : `${role}：${m.content}`
+  })
+  return '【从之前的聊天记录里翻到，可能和你的问题有关】\n' + lines.join('\n')
 }
 
 // ---------- 模型 ----------
@@ -369,6 +607,11 @@ async function serveGet(request) {
     const thread = readJsonUrl(threadUrl(id), null)
     return thread ? jsonResponse(thread) : jsonResponse({ error: 'not found' }, 404)
   }
+  if (path === `${BASE}/episodes`) {
+    const mem = loadMemory()
+    const eps = (mem.episodes || []).slice().reverse()
+    return jsonResponse({ episodes: eps, summary: mem.summary, count: eps.length })
+  }
   return new Response('not found', { status: 404 })
 }
 
@@ -405,6 +648,7 @@ async function save(ctx, req, res) {
   }
   try {
     const thread = saveThread(body)
+    maybeGenerateEpisodes(ctx, thread.threadId, thread.messages)
     return sendJson(res, 200, { ok: true, threadId: thread.threadId, updatedAt: thread.updatedAt })
   } catch (error) {
     return sendJson(res, 500, { error: String((error && error.message) || error).slice(0, 200) })
@@ -422,7 +666,19 @@ async function chat(ctx, req, res) {
   }
   const cfg = tune()
   const memory = cleanNotes(body && body.notes)
-  const history = normMessages(body && body.messages).slice(-cfg.historyTurns)
+  const full = normMessages(body && body.messages)
+  const history = full.slice(-cfg.historyTurns)
+
+  // 主动回忆 + 原文回溯
+  const mem = loadMemory()
+  const lastUser = [...full].reverse().find((m) => m.role === 'user')
+  const recall = lastUser ? recallEpisodes(lastUser.content, mem) : []
+  const recallStr = lastUser ? recallBlock(recall, mem.summary) : ''
+  const hasQuestion = lastUser ? /[?？]/.test(lastUser.content) : false
+  const backStr = lastUser && (recall.length === 0 || hasQuestion)
+    ? backtrackBlock(full, lastUser.content)
+    : ''
+  const factsStr = factsBlock()
 
   const { provider, model } = selection(ctx, cfg)
   const splitter = new Splitter(cfg.bubbleSoft, cfg.bubbleHard)
@@ -444,7 +700,7 @@ async function chat(ctx, req, res) {
     const options = {
       provider,
       model,
-      system: buildSystem(memory),
+      system: buildSystem(memory, recallStr, backStr, factsStr),
       messages: [{ role: 'user', content: [{ type: 'text', text: buildTranscript(history) }] }],
       temperature: cfg.temperature,
       maxTokens: cfg.maxTokens,
@@ -476,7 +732,7 @@ async function notes(ctx, req, res) {
     return sendJson(res, 400, { error: 'bad json' })
   }
   const memory = cleanNotes(body && body.notes)
-  const history = normMessages(body && body.messages).slice(-14)
+  const history = normMessages(body && body.messages).slice(-60)
 
   if (history.length < 2) return sendJson(res, 200, { notes: memory, updated: false })
 
@@ -487,6 +743,11 @@ async function notes(ctx, req, res) {
     return ts ? `[${ts}] ${role}：${m.content}` : `${role}：${m.content}`
   })
   const transcript = `现在是 ${formatNow()}。\n${tLines.join('\n')}`
+  // 把最近的事件卡也喂给 notes 提取，帮它把具体名字（游戏名/人名等）提进事实层
+  const mem = loadMemory()
+  const epLines = (mem.episodes || []).slice(-12)
+    .map((e) => `${e.theme}（${(e.keywords || []).join('、')}）`)
+    .join('\n')
   const abort = new AbortController()
   req.on('close', () => abort.abort())
 
@@ -500,12 +761,12 @@ async function notes(ctx, req, res) {
         {
           role: 'user',
           content: [
-            { type: 'text', text: `旧记忆：\n${JSON.stringify(memory)}\n\n最近的对话：\n${transcript}` },
+            { type: 'text', text: `旧记忆：\n${JSON.stringify(memory)}\n\n最近的事件卡（从中提取具体名字、游戏名、人名）：\n${epLines}\n\n最近的对话：\n${transcript}` },
           ],
         },
       ],
       temperature: 0.3,
-      maxTokens: 700,
+      maxTokens: 2000,
       reasoningEffort: 'low',
       signal: abort.signal,
     })) {

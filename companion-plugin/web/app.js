@@ -233,7 +233,7 @@
       const resp = await fetch(BASE + '/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ notes: S.notes, messages: S.history.slice(-200) }),
+        body: JSON.stringify({ notes: S.notes, messages: S.history }),
         signal: ctrl.signal,
       });
       if (!resp.ok || !resp.body) throw new Error('HTTP ' + resp.status);
@@ -276,7 +276,7 @@
       const r = await fetch(BASE + '/notes', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ notes: S.notes, messages: S.history.slice(-14) }),
+        body: JSON.stringify({ notes: S.notes, messages: S.history.slice(-60) }),
       });
       if (!r.ok) return;
       const d = await r.json();
@@ -409,11 +409,48 @@
     }
   }
 
+  async function renderEpisodes() {
+    const box = $('episodes');
+    if (!box) return;
+    box.innerHTML = '<p class="mem-empty">读取中…</p>';
+    try {
+      const d = await (await fetch(BASE + '/episodes')).json();
+      const items = d.episodes || [];
+      box.innerHTML = '';
+      if (!items.length) {
+        box.innerHTML = '<p class="mem-empty">还没有事件卡，多聊几句就有了。</p>';
+        return;
+      }
+      for (const e of items) {
+        const div = document.createElement('div');
+        div.className = 'episode';
+        const t = document.createElement('div');
+        t.className = 'episode-theme';
+        t.textContent = e.theme;
+        const c = document.createElement('div');
+        c.className = 'episode-content';
+        c.textContent = e.content;
+        div.appendChild(t);
+        div.appendChild(c);
+        if (e.mood) {
+          const m = document.createElement('div');
+          m.className = 'episode-mood';
+          m.textContent = e.mood;
+          div.appendChild(m);
+        }
+        box.appendChild(div);
+      }
+    } catch {
+      box.innerHTML = '<p class="mem-empty">读取失败。</p>';
+    }
+  }
+
   // ---------- 设置 ----------
   $('gear').addEventListener('click', () => {
     renderMem();
     updateUsage();
     renderThreads();
+    renderEpisodes();
     panel.classList.add('open');
   });
   panel.addEventListener('click', (e) => { if (e.target === panel) panel.classList.remove('open'); });

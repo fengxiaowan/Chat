@@ -156,3 +156,9 @@ footer {
 .thread:hover { border-color: #cfe6c0; background: #f6fcf3; }
 .thread-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .thread-meta { flex: 0 0 auto; color: #aaa; font-size: 11px; }
+
+.episodes { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; max-height: 320px; overflow-y: auto; }
+.episode { border: 1px solid #eee; background: #fafafa; border-radius: 6px; padding: 8px 10px; font-size: 13px; }
+.episode-theme { font-weight: 600; color: #333; }
+.episode-content { color: #666; margin-top: 2px; line-height: 1.5; }
+.episode-mood { color: #aaa; font-size: 11px; margin-top: 3px; }

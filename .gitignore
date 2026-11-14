@@ -1,0 +1,14 @@
+# 运行数据与日志（含私密对话记录）
+companion-plugin/data/
+companion-proxy/logs/
+*.log
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 环境变量与凭据
+.env
+.env.*
+*.pem
+*.key

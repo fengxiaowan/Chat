@@ -1,0 +1,11 @@
+{
+  "provider": "deepseek-account",
+  "model": "deepseek-v4-pro",
+  "maxBubbles": 6,
+  "maxTokens": 600,
+  "temperature": 1.0,
+  "reasoningEffort": "low",
+  "historyTurns": 26,
+  "bubbleSoft": 30,
+  "bubbleHard": 46
+}

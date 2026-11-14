@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Companion chat",
+    "description": "A WeChat-style chat page that replies in short separate messages and gradually remembers you. It uses the model of your current DSH account, so there is no API key to fill in.",
+    "detail": "docs/DETAIL.md"
+  }
+}

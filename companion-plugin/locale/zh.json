@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "闲聊",
+    "description": "一个微信式的闲聊页面：回复很短、一条一句地发，聊着聊着会自己记住你。用的是当前 DSH 账号里的模型，不需要填 API Key。",
+    "detail": "docs/DETAIL.md"
+  }
+}

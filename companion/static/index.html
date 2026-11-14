@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>闲聊</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="phone">
+  <header>
+    <div class="bar">
+      <div class="title">
+        <span id="who">TA</span>
+        <span id="status" class="status"></span>
+      </div>
+      <button id="gear" class="gear" title="设置">⚙</button>
+    </div>
+    <div id="demo" class="demo" hidden>
+      <span>演示模式 · 现在回你的不是模型，是本地预设的几句话</span>
+      <button id="demo-set">去填 Key</button>
+    </div>
+  </header>
+
+  <main id="list" class="list"></main>
+
+  <footer>
+    <textarea id="input" rows="1" placeholder="说点什么…" autocomplete="off"></textarea>
+    <button id="send" class="send">发送</button>
+  </footer>
+</div>
+
+<aside id="panel" class="panel">
+  <div class="panel-inner">
+    <h2>设置</h2>
+
+    <label class="field">
+      <span>DeepSeek API Key</span>
+      <input id="key" type="password" placeholder="sk-…（不填就是演示模式）" autocomplete="off">
+    </label>
+    <p class="hint">只存在这台电脑的浏览器里，只发给本机服务转发。填上 Key 之后，回复才是真的模型生成的。</p>
+
+    <div class="field">
+      <span>它记住的 <em class="tag">聊天里自己学的</em></span>
+      <div id="mem" class="mem"></div>
+      <p class="hint">不用填。聊着聊着它自己记，记错了就清掉重来。</p>
+      <button id="clear-mem" class="link">清空记忆</button>
+    </div>
+
+    <div class="row-btns">
+      <button id="save" class="primary">保存</button>
+      <button id="reset">清空对话</button>
+      <button id="close">关掉</button>
+    </div>
+  </div>
+</aside>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

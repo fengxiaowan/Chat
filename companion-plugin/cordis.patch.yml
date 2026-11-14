@@ -1,0 +1,4 @@
+- insert:
+    - id: companion-liao
+      name: '@local/companion-liao'
+      config: {}

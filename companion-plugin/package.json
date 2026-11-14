@@ -1,0 +1,25 @@
+{
+  "name": "@local/companion-liao",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A WeChat-style casual chat page that talks with the model of your current DSH account.",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "web",
+    "locale/*.json",
+    "docs",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

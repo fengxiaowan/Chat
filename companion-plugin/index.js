@@ -81,12 +81,28 @@ function authPassword() {
   } catch { return '' }
 }
 
-function checkAuth(authHeader) {
+// 记住登录用的 cookie 值（密码变了自动失效）
+function authCookie() {
+  const pw = authPassword()
+  try { return createHash('sha256').update('companion-auth:' + pw).digest('hex') } catch { return '' }
+}
+
+function headerValue(headers, name) {
+  if (!headers) return ''
+  if (typeof headers.get === 'function') return String(headers.get(name) || '')
+  return String(headers[name] || '')
+}
+
+function checkAuth(headers) {
   const pw = authPassword()
   if (!pw) return true
-  if (!authHeader || !String(authHeader).startsWith('Basic ')) return false
+  const cookie = headerValue(headers, 'cookie')
+  const want = authCookie()
+  if (want && cookie.includes('companion_auth=' + want)) return true
+  const authHeader = headerValue(headers, 'authorization')
+  if (!authHeader.startsWith('Basic ')) return false
   try {
-    const decoded = Buffer.from(String(authHeader).slice(6), 'base64').toString('utf8')
+    const decoded = Buffer.from(authHeader.slice(6), 'base64').toString('utf8')
     const idx = decoded.indexOf(':')
     return idx >= 0 && decoded.slice(idx + 1) === pw
   } catch { return false }
@@ -711,13 +727,17 @@ const ASSETS = {
 }
 
 async function serveGet(request) {
-  if (!checkAuth(request.headers.get('authorization'))) return UNAUTH_RES
+  if (!checkAuth(request.headers)) return UNAUTH_RES
   const url = new URL(request.url)
   const path = url.pathname.replace(/\/+$/, '') || BASE
 
   if (path === BASE) {
     return new Response(read('index.html'), {
-      headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
+      headers: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store',
+        'set-cookie': `companion_auth=${authCookie()}; Max-Age=2592000; Path=/liao; SameSite=Lax`,
+      },
     })
   }
   const asset = ASSETS[path]
@@ -780,7 +800,7 @@ export function apply(ctx) {
 }
 
 async function handlePost(ctx, name, req, res) {
-  if (!checkAuth(req.headers.authorization)) {
+  if (!checkAuth(req.headers)) {
     res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="companion"', 'content-type': 'text/plain; charset=utf-8' })
     res.end('Unauthorized')
     return

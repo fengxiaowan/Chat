@@ -1,0 +1,180 @@
+// 独立版：不依赖 DSH，直接跑 companion 插件逻辑，模型调用走 OpenAI 兼容中转。
+//
+// 原理：插件只依赖三个 DSH 服务（webServer.register / llm.stream / agentDefaultModel），
+// 这里用一个很小的"模拟环境"实现它们，然后把插件的 apply() 原样跑起来。
+import http from 'node:http'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { apply as applyPlugin } from '../companion-plugin/index.js'
+
+const CONFIG_PATH = fileURLToPath(new URL('./config.json', import.meta.url))
+const config = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
+
+const BASE_URL = String(config.baseUrl || '').replace(/\/+$/, '')
+const API_KEY = String(config.apiKey || '')
+const CHAT_MODEL = config.chatModel || 'deepseek-v4-pro'
+const EXTRACT_MODEL = config.extractModel || 'deepseek-v4-flash'
+const PORT = Number(config.port || 8788)
+
+// 把插件的 DSH 模型名映射到中转的模型名
+function mapModel(model) {
+  const m = String(model || '')
+  if (/flash/i.test(m)) return EXTRACT_MODEL
+  if (/pro/i.test(m)) return CHAT_MODEL
+  return m || CHAT_MODEL
+}
+
+// ---------- 模拟 llm.stream ----------
+
+async function* relayStream(options) {
+  const body = {
+    model: mapModel(options && options.model),
+    messages: [
+      ...(options && options.system ? [{ role: 'system', content: options.system }] : []),
+      ...((options && options.messages) || []),
+    ],
+    temperature: options && options.temperature != null ? options.temperature : 1,
+    max_tokens: options && options.maxTokens != null ? options.maxTokens : 600,
+    stream: true,
+  }
+
+  const res = await fetch(`${BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${API_KEY}`,
+    },
+    body: JSON.stringify(body),
+    signal: options && options.signal,
+  })
+
+  if (!res.ok || !res.body) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`relay ${res.status}: ${text.slice(0, 300)}`)
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    let idx
+    while ((idx = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, idx).replace(/\r$/, '').trim()
+      buf = buf.slice(idx + 1)
+      if (!line.startsWith('data:')) continue
+      const data = line.slice(5).trim()
+      if (!data || data === '[DONE]') {
+        if (data === '[DONE]') return
+        continue
+      }
+      let json
+      try { json = JSON.parse(data) } catch { continue }
+      const delta = json.choices && json.choices[0] && json.choices[0].delta
+      if (!delta) continue
+      if (typeof delta.content === 'string' && delta.content) {
+        yield { type: 'text-delta', text: delta.content }
+      }
+      const reasoning = delta.reasoning_content || delta.reasoning
+      if (typeof reasoning === 'string' && reasoning) {
+        yield { type: 'reasoning-delta', text: reasoning }
+      }
+    }
+  }
+}
+
+// ---------- 模拟 webServer ----------
+
+const routes = []
+const webServer = {
+  register(route) {
+    routes.push(route)
+    return () => {}
+  },
+}
+
+const ctx = {
+  webServer,
+  llm: { stream: relayStream },
+  agentDefaultModel: {
+    currentSelection: () => ({ provider: 'relay', model: CHAT_MODEL }),
+  },
+}
+
+applyPlugin(ctx)
+
+// ---------- 路由匹配 + HTTP 服务 ----------
+
+function matchRoute(pathname) {
+  // exact 优先
+  for (const r of routes) {
+    if (r.kind === 'exact' && r.path === pathname) return r
+  }
+  // prefix 里取最长匹配
+  let best = null
+  for (const r of routes) {
+    if (r.kind !== 'prefix') continue
+    if (pathname === r.path || pathname.startsWith(r.path)) {
+      if (!best || r.path.length > best.path.length) best = r
+    }
+  }
+  return best
+}
+
+async function sendWebResponse(res, resp) {
+  const headers = {}
+  resp.headers.forEach((v, k) => { headers[k] = v })
+  res.writeHead(resp.status || 200, headers)
+  if (!resp.body) { res.end(); return }
+  const reader = resp.body.getReader()
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    res.write(Buffer.from(value))
+  }
+  res.end()
+}
+
+const server = http.createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url, 'http://127.0.0.1')
+    if (url.pathname === '/') {
+      res.writeHead(302, { location: '/liao' })
+      res.end()
+      return
+    }
+    const route = matchRoute(url.pathname)
+    if (!route) {
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
+      res.end('not found')
+      return
+    }
+    if (route.resource) {
+      const request = new Request('http://127.0.0.1' + req.url, {
+        method: req.method || 'GET',
+        headers: req.headers,
+      })
+      const resp = await route.resource(request)
+      await sendWebResponse(res, resp)
+      return
+    }
+    if (route.handler) {
+      await route.handler(req, res)
+      return
+    }
+    res.writeHead(405)
+    res.end()
+  } catch (error) {
+    if (!res.headersSent) {
+      res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' })
+    }
+    try { res.end(String((error && error.message) || error)) } catch {}
+  }
+})
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`[standalone] http://127.0.0.1:${PORT}/liao`)
+  console.log(`[standalone] relay ${BASE_URL}  chat=${CHAT_MODEL}  extract=${EXTRACT_MODEL}`)
+})

@@ -1,7 +1,7 @@
 {
   "provider": "deepseek-account",
   "model": "deepseek-v4-pro",
-  "password": "miaoyh314",
+  "password": "111",
   "ttsVoice": "zh-CN-XiaoxiaoNeural",
   "ttsRate": "+8%",
   "maxBubbles": 6,

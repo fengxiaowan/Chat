@@ -8,7 +8,8 @@
   "maxTokens": 600,
   "temperature": 1,
   "reasoningEffort": "low",
-  "historyTurns": 100,
+  "historyTurns": 30,
+  "extractModel": "deepseek-flash",
   "bubbleSoft": 30,
   "bubbleHard": 60
 }

@@ -474,7 +474,7 @@ async function maybeGenerateEpisodes(ctx, threadId, messages) {
 }
 
 async function compressEpisodes(ctx, messages) {
-  const { provider, model } = selection(ctx, tune())
+  const { provider, model } = extractSelection(tune())
   const lines = messages.map((m) => {
     const role = m.role === 'user' ? '对方' : '你'
     const ts = formatTs(m.ts)
@@ -613,6 +613,13 @@ function selection(ctx, cfg) {
     if (sel && sel.provider && sel.model) return sel
   } catch {}
   return { provider: 'deepseek-account', model: 'deepseek-v4-pro' }
+}
+
+// 记忆提取（notes/事件卡）用便宜的快模型，聊天仍用 tune 里的主模型
+function extractSelection(cfg) {
+  const model = (cfg && cfg.extractModel) ? String(cfg.extractModel) : 'deepseek-flash'
+  const provider = (cfg && cfg.provider) || 'deepseek-account'
+  return { provider, model }
 }
 
 function isText(chunk) {
@@ -908,11 +915,11 @@ async function notes(ctx, req, res) {
     return sendJson(res, 400, { error: 'bad json' })
   }
   const memory = cleanNotes(body && body.notes)
-  const history = normMessages(body && body.messages).slice(-60)
+  const history = normMessages(body && body.messages).slice(-40)
 
   if (history.length < 2) return sendJson(res, 200, { notes: memory, updated: false })
 
-  const { provider, model } = selection(ctx, tune())
+  const { provider, model } = extractSelection(tune())
   const tLines = history.map((m) => {
     const role = m.role === 'user' ? '对方' : '你'
     const ts = formatTs(m.ts)
@@ -942,7 +949,7 @@ async function notes(ctx, req, res) {
         },
       ],
       temperature: 0.3,
-      maxTokens: 2000,
+      maxTokens: 800,
       reasoningEffort: 'low',
       signal: abort.signal,
     })) {

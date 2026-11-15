@@ -394,7 +394,10 @@
           }
         }
       }
-      if (got > 0 && gen === S.gen) updateNotes();
+      if (got > 0 && gen === S.gen) {
+        S.notesTick = (S.notesTick || 0) + 1;
+        if (S.notesTick % 5 === 0) updateNotes();
+      }
     }
   }
 

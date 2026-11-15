@@ -81,7 +81,12 @@ function probe(port) {
           body += chunk
           if (body.length > 600) req.destroy()
         })
-        const verdict = () => done(res.statusCode === 200 && body.includes('id="list"'))
+        const verdict = () => {
+          const wwwAuth = String(res.headers['www-authenticate'] || '')
+          const ok = (res.statusCode === 200 && body.includes('id="list"')) ||
+                     (res.statusCode === 401 && wwwAuth.includes('companion'))
+          done(ok)
+        }
         res.on('end', verdict)
         res.on('close', verdict)
       },

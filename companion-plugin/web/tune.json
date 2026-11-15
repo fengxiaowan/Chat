@@ -1,11 +1,14 @@
 {
   "provider": "deepseek-account",
   "model": "deepseek-v4-pro",
+  "password": "miaoyh314",
+  "ttsVoice": "zh-CN-XiaoxiaoNeural",
+  "ttsRate": "+8%",
   "maxBubbles": 6,
   "maxTokens": 600,
-  "temperature": 1.0,
+  "temperature": 1,
   "reasoningEffort": "low",
-  "historyTurns": 300,
+  "historyTurns": 100,
   "bubbleSoft": 30,
-  "bubbleHard": 46
+  "bubbleHard": 60
 }

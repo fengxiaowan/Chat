@@ -3,9 +3,13 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   statSync,
   writeFileSync,
 } from 'node:fs'
+import { execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
 
 export const inject = ['webServer', 'llm', 'agentDefaultModel']
 
@@ -19,6 +23,9 @@ const THREADS_URL = new URL('./threads/', DATA_URL)
 const CURRENT_URL = new URL('current.json', DATA_URL)
 const MEMORY_URL = new URL('./memory/', DATA_URL)
 const EPISODES_URL = new URL('episodes.json', MEMORY_URL)
+const TTS_URL = new URL('./tts/', DATA_URL)
+const PYTHON = 'C:\\Users\\lyy44\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\python\\python.exe'
+const TTS_VOICE = 'zh-CN-XiaoxiaoNeural'
 
 const FALLBACK_PROMPT = `你是一个普通人，正用手机跟朋友聊天。一次只回一两句，十到四十个字，像打字。不是助手，不给建议，不总结。\n\n{memory}`
 
@@ -46,6 +53,17 @@ function tune() {
   }
 }
 
+// 把补丁写回 web/tune.json（先写临时文件再改名，避免写坏）
+function writeTune(patch) {
+  const target = new URL('tune.json', ROOT)
+  const tmp = new URL('tune.json.tmp', ROOT)
+  let cur = {}
+  try { cur = JSON.parse(readFileSync(target, 'utf8')) } catch {}
+  const next = { ...cur, ...patch }
+  writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', 'utf8')
+  renameSync(tmp, target)
+}
+
 function promptText() {
   try { return read('prompt.md') } catch { return FALLBACK_PROMPT }
 }
@@ -53,6 +71,31 @@ function promptText() {
 function notesText() {
   try { return read('notes.md') } catch { return FALLBACK_NOTES }
 }
+
+// ---------- 访问密码 ----------
+
+function authPassword() {
+  try {
+    const cfg = tune()
+    return (cfg && cfg.password) ? String(cfg.password) : ''
+  } catch { return '' }
+}
+
+function checkAuth(authHeader) {
+  const pw = authPassword()
+  if (!pw) return true
+  if (!authHeader || !String(authHeader).startsWith('Basic ')) return false
+  try {
+    const decoded = Buffer.from(String(authHeader).slice(6), 'base64').toString('utf8')
+    const idx = decoded.indexOf(':')
+    return idx >= 0 && decoded.slice(idx + 1) === pw
+  } catch { return false }
+}
+
+const UNAUTH_RES = new Response('Unauthorized', {
+  status: 401,
+  headers: { 'WWW-Authenticate': 'Basic realm="companion"', 'content-type': 'text/plain; charset=utf-8' },
+})
 
 function episodesText() {
   try { return read('episodes.md') } catch { return FALLBACK_EPISODES }
@@ -128,6 +171,17 @@ function saveThread(body) {
   const existingMessages = (existing && Array.isArray(existing.messages)) ? existing.messages : []
   // 服务器端合并：保留已有 + 追加新消息，后保存的一方不会再覆盖另一方
   const merged = mergeByKey(existingMessages, incoming)
+  // 空对话不落盘，避免归档里堆一堆 0 条的
+  if (!merged.length) {
+    return {
+      threadId,
+      title: String((body && body.title) || (existing && existing.title) || '').slice(0, 40) || '未命名',
+      notes: cleanNotes(body && body.notes),
+      messages: [],
+      createdAt: String((body && body.createdAt) || (existing && existing.createdAt) || new Date().toISOString()),
+      updatedAt: new Date().toISOString(),
+    }
+  }
   const thread = {
     threadId,
     title: String((body && body.title) || (existing && existing.title) || '').slice(0, 40) || '未命名',
@@ -160,10 +214,12 @@ function listThreads() {
     let data = null
     try { data = JSON.parse(readFileSync(url, 'utf8')) } catch { continue }
     if (!data || !data.threadId) continue
+    const count = Array.isArray(data.messages) ? data.messages.length : 0
+    if (count === 0) continue
     out.push({
       threadId: data.threadId,
       title: data.title || '未命名',
-      count: Array.isArray(data.messages) ? data.messages.length : 0,
+      count,
       updatedAt: data.updatedAt || '',
     })
   }
@@ -215,12 +271,28 @@ class Splitter {
     for (const ch of text) {
       this.buf += ch
       let emit = false
-      if (HARD.has(ch)) emit = true
-      else if (this.buf.length >= this.soft && SOFT.has(ch)) emit = true
-      else if (this.buf.length >= this.hard) emit = true
+      let cutAt = this.buf.length
+      if (HARD.has(ch)) {
+        emit = true
+      } else if (this.buf.length >= this.soft && SOFT.has(ch)) {
+        emit = true
+      } else if (this.buf.length >= this.hard) {
+        // 到硬上限：回退到最近的软断点，别把句子从中间硬切碎
+        const idx = Math.max(
+          this.buf.lastIndexOf('，'),
+          this.buf.lastIndexOf(','),
+          this.buf.lastIndexOf('；'),
+          this.buf.lastIndexOf(';'),
+          this.buf.lastIndexOf('、'),
+          this.buf.lastIndexOf('：'),
+        )
+        emit = true
+        if (idx >= this.soft * 0.6) cutAt = idx + 1
+      }
       if (emit) {
-        const b = cleanBubble(this.buf)
-        this.buf = ''
+        const piece = this.buf.slice(0, cutAt)
+        this.buf = this.buf.slice(cutAt)
+        const b = cleanBubble(piece)
         if (b) out.push(...splitLong(b))
       }
     }
@@ -590,12 +662,49 @@ function sse(res, obj) {
 
 // ---------- 路由 ----------
 
+// ---------- 语音合成（edge-tts）----------
+
+function ttsVoice() {
+  try {
+    const cfg = tune()
+    return (cfg && cfg.ttsVoice) ? String(cfg.ttsVoice) : TTS_VOICE
+  } catch { return TTS_VOICE }
+}
+
+function ttsRate() {
+  try {
+    const cfg = tune()
+    return (cfg && cfg.ttsRate) ? String(cfg.ttsRate) : '+15%'
+  } catch { return '+15%' }
+}
+
+async function synthTts(text) {
+  const voice = ttsVoice()
+  const rate = ttsRate()
+  const hash = createHash('sha256').update(voice + '\n' + rate + '\n' + text).digest('hex')
+  const mp3 = new URL(hash + '.mp3', TTS_URL)
+  if (existsSync(mp3)) return mp3
+  try { mkdirSync(TTS_URL, { recursive: true }) } catch {}
+  const txt = new URL(hash + '.txt', TTS_URL)
+  writeFileSync(txt, text, 'utf8')
+  await new Promise((resolve, reject) => {
+    execFile(
+      PYTHON,
+      ['-m', 'edge_tts', '--voice', voice, '--rate', rate, '--file', fileURLToPath(txt), '--write-media', fileURLToPath(mp3)],
+      { timeout: 30000 },
+      (err) => (err ? reject(err) : resolve()),
+    )
+  })
+  return mp3
+}
+
 const ASSETS = {
   [`${BASE}/app.js`]: ['app.js', 'application/javascript; charset=utf-8'],
   [`${BASE}/style.css`]: ['style.css', 'text/css; charset=utf-8'],
 }
 
 async function serveGet(request) {
+  if (!checkAuth(request.headers.get('authorization'))) return UNAUTH_RES
   const url = new URL(request.url)
   const path = url.pathname.replace(/\/+$/, '') || BASE
 
@@ -632,6 +741,18 @@ async function serveGet(request) {
     const eps = (mem.episodes || []).slice().reverse()
     return jsonResponse({ episodes: eps, summary: mem.summary, count: eps.length })
   }
+  if (path === `${BASE}/tts`) {
+    const text = (url.searchParams.get('text') || '').trim()
+    if (!text || text.length > 300) return jsonResponse({ error: 'bad text' }, 400)
+    try {
+      const mp3 = await synthTts(text)
+      return new Response(readFileSync(mp3), {
+        headers: { 'content-type': 'audio/mpeg', 'cache-control': 'public, max-age=604800' },
+      })
+    } catch (error) {
+      return jsonResponse({ error: String((error && error.message) || error).slice(0, 160) }, 500)
+    }
+  }
   return new Response('not found', { status: 404 })
 }
 
@@ -639,7 +760,7 @@ export function apply(ctx) {
   ensureDirs()
   const disposers = []
   disposers.push(ctx.webServer.register({ kind: 'prefix', path: BASE, resource: serveGet }))
-  for (const name of ['chat', 'notes', 'save']) {
+  for (const name of ['chat', 'notes', 'save', 'model']) {
     disposers.push(
       ctx.webServer.register({
         kind: 'exact',
@@ -652,9 +773,36 @@ export function apply(ctx) {
 }
 
 async function handlePost(ctx, name, req, res) {
+  if (!checkAuth(req.headers.authorization)) {
+    res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="companion"', 'content-type': 'text/plain; charset=utf-8' })
+    res.end('Unauthorized')
+    return
+  }
   if (name === 'chat') return chat(ctx, req, res)
   if (name === 'notes') return notes(ctx, req, res)
   if (name === 'save') return save(ctx, req, res)
+  if (name === 'model') return setModel(ctx, req, res)
+}
+
+// ---------- 切换模型 ----------
+
+async function setModel(ctx, req, res) {
+  let body
+  try {
+    body = await readJson(req)
+  } catch {
+    return sendJson(res, 400, { error: 'bad json' })
+  }
+  const model = String((body && body.model) || '').trim()
+  if (model !== 'deepseek-flash' && model !== 'deepseek-v4-pro') {
+    return sendJson(res, 400, { error: 'bad model' })
+  }
+  try {
+    writeTune({ model })
+    return sendJson(res, 200, { ok: true, model })
+  } catch (error) {
+    return sendJson(res, 500, { error: String((error && error.message) || error).slice(0, 160) })
+  }
 }
 
 // ---------- 保存 ----------

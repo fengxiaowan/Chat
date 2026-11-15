@@ -31,12 +31,28 @@
 
 <aside id="panel" class="panel">
   <div class="panel-inner">
-    <h2>设置 <span id="ver" class="ver"></span></h2>
+    <div class="panel-head">
+      <h2>设置 <span id="ver" class="ver"></span></h2>
+      <button id="close-panel" class="panel-close" title="关闭">✕</button>
+    </div>
     <p class="hint" style="margin-top:0">用的是你 DSH 账号里的模型，不用填 Key。对话会自动存到磁盘。</p>
 
     <div class="field">
       <span>当前上下文</span>
       <p id="usage" class="usage"></p>
+    </div>
+
+    <div class="field">
+      <span>语音</span>
+      <label class="checkbox"><input type="checkbox" id="autoplay"> ta 的消息自动朗读</label>
+      <p class="hint">点任意一条 ta 的气泡也能朗读/停止；自动朗读开启后，新消息会按顺序读出来。</p>
+    </div>
+
+    <div class="field">
+      <span>模型 <em class="tag">下一条消息生效</em></span>
+      <label class="checkbox"><input type="radio" name="model" value="deepseek-flash"> flash（便宜、快）</label>
+      <label class="checkbox"><input type="radio" name="model" value="deepseek-v4-pro"> pro（更聪明、更贵）</label>
+      <p class="hint">切换后下一条消息就用新模型，不用重启。</p>
     </div>
 
     <div class="field">

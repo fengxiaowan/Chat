@@ -76,19 +76,108 @@
     el.textContent = text;
     el.classList.toggle('typing', !!typing);
   }
+  let ttsAudio = null;
+  let playingEl = null;
+  let playEndCb = null;
+  let ttsQueue = [];
+  let ttsQueueActive = false;
+  let autoPlay = read('companion.autoplay', false);
+
+  // 单例 audio：解锁一次，之后换 src 复用（新 Audio 每次都会被拦）
+  function getAudio() {
+    if (!ttsAudio) {
+      ttsAudio = document.createElement('audio');
+      ttsAudio.preload = 'auto';
+      ttsAudio.addEventListener('ended', () => finishPlay());
+      ttsAudio.addEventListener('error', () => finishPlay());
+    }
+    return ttsAudio;
+  }
+  function finishPlay() {
+    if (playingEl) playingEl.classList.remove('playing');
+    playingEl = null;
+    const cb = playEndCb;
+    playEndCb = null;
+    if (cb) cb();
+  }
+  // 在用户手势里先播一次静音，解锁自动播放
+  function unlockAudio() {
+    try {
+      const a = getAudio();
+      if (!a.paused) return;
+      a.muted = true;
+      a.src = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+      const p = a.play();
+      const done = () => { try { a.pause(); } catch {} a.muted = false; };
+      if (p && p.then) p.then(done).catch(() => { a.muted = false; });
+      else done();
+    } catch {}
+  }
+  document.addEventListener('pointerdown', unlockAudio, { once: true });
+  document.addEventListener('keydown', unlockAudio, { once: true });
+  document.addEventListener('touchstart', unlockAudio, { once: true });
+
+  function stopAllTts() {
+    try { getAudio().pause(); } catch {}
+    ttsQueue = [];
+    if (playingEl) playingEl.classList.remove('playing');
+    playingEl = null;
+    playEndCb = null;
+  }
+  function playOne(text, bubbleEl, onEnd) {
+    const a = getAudio();
+    try { a.pause(); } catch {}
+    if (playingEl) playingEl.classList.remove('playing');
+    playingEl = bubbleEl || null;
+    if (playingEl) playingEl.classList.add('playing');
+    playEndCb = onEnd || null;
+    a.muted = false;
+    a.src = BASE + '/tts?text=' + encodeURIComponent(text);
+    a.play().catch(() => { finishPlay(); });
+  }
+  function toggleBubble(text, bubbleEl) {
+    if (playingEl === bubbleEl && ttsAudio && !ttsAudio.paused) {
+      stopAllTts();
+    } else {
+      stopAllTts();
+      playOne(text, bubbleEl);
+    }
+  }
+  function enqueueTts(text, bubbleEl) {
+    if (!autoPlay) return;
+    ttsQueue.push({ text, bubbleEl });
+    if (!ttsQueueActive) pumpTtsQueue();
+  }
+  function pumpTtsQueue() {
+    ttsQueueActive = true;
+    const step = () => {
+      if (!ttsQueue.length) { ttsQueueActive = false; return; }
+      const item = ttsQueue.shift();
+      playOne(item.text, item.bubbleEl, step);
+    };
+    step();
+  }
+
   function makeBubble(role, text) {
     const row = document.createElement('div');
     row.className = 'row' + (role === 'user' ? ' mine' : '') + (role === 'err' ? ' err' : '');
     const b = document.createElement('div');
     b.className = 'bubble';
     b.textContent = text;
+    if (role === 'assistant') {
+      b.classList.add('tts');
+      b.title = '点击朗读 / 再点停止';
+      b.addEventListener('click', () => toggleBubble(text, b));
+    }
     row.appendChild(b);
     return row;
   }
   function addBubble(role, text) {
     hideTyping();
-    list.appendChild(makeBubble(role, text));
+    const row = makeBubble(role, text);
+    list.appendChild(row);
     scrollBottom();
+    return row.querySelector('.bubble');
   }
   function addDivider(text) {
     const d = document.createElement('div');
@@ -206,7 +295,8 @@
       const text = S.queue[S.idx++];
       await typeOut(text, gen);
       if (gen !== S.gen) return;
-      addBubble('assistant', text);
+      const bubbleEl = addBubble('assistant', text);
+      enqueueTts(text, bubbleEl);
       S.history.push({ role: 'assistant', content: text, ts: Date.now() });
       scheduleSave();
       updateUsage();
@@ -218,6 +308,7 @@
   async function send() {
     const text = input.value.trim();
     if (!text) return;
+    unlockAudio();
     input.value = '';
     autosize();
     addBubble('user', text);
@@ -493,6 +584,41 @@
   });
   panel.addEventListener('click', (e) => { if (e.target === panel) panel.classList.remove('open'); });
   $('save').addEventListener('click', () => panel.classList.remove('open'));
+  const closePanel = $('close-panel');
+  if (closePanel) closePanel.addEventListener('click', () => panel.classList.remove('open'));
+
+  // 自动朗读开关
+  const apEl = $('autoplay');
+  if (apEl) {
+    apEl.checked = autoPlay;
+    apEl.addEventListener('change', () => {
+      autoPlay = apEl.checked;
+      write('companion.autoplay', autoPlay);
+      if (autoPlay) unlockAudio();
+      else stopAllTts();
+    });
+  }
+
+  // 模型切换
+  function syncModelUI() {
+    document.querySelectorAll('input[name="model"]').forEach((el) => {
+      el.checked = (el.value === S.model);
+    });
+  }
+  document.querySelectorAll('input[name="model"]').forEach((el) => {
+    el.addEventListener('change', async () => {
+      if (!el.checked) return;
+      const model = el.value;
+      try {
+        const r = await fetch(BASE + '/model', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model }),
+        });
+        if (r.ok) S.model = model;
+      } catch {}
+    });
+  });
 
   $('new').addEventListener('click', async () => {
     if (S.history.length && !confirm('开一段新的对话？现在这段会存进归档，随时能翻回来。')) return;
@@ -589,6 +715,7 @@
       const info = await (await fetch(BASE + '/info')).json();
       if (info && info.historyTurns) S.limit = info.historyTurns;
       if (info && info.model) S.model = info.model;
+      syncModelUI();
       updateUsage();
     } catch {}
     scheduleSave(200);

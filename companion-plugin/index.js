@@ -23,6 +23,7 @@ const THREADS_URL = new URL('./threads/', DATA_URL)
 const CURRENT_URL = new URL('current.json', DATA_URL)
 const MEMORY_URL = new URL('./memory/', DATA_URL)
 const EPISODES_URL = new URL('episodes.json', MEMORY_URL)
+const IMAGES_URL = new URL('./images/', DATA_URL)
 const TTS_URL = new URL('./tts/', DATA_URL)
 const PYTHON = 'C:\\Users\\lyy44\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\python\\python.exe'
 const TTS_VOICE = 'zh-CN-XiaoxiaoNeural'
@@ -127,7 +128,7 @@ const MAX_EPISODES = 200        // 事件卡超过该数量时，把最旧一批
 const RECALL_K = 4             // 每轮主动回忆最多注入几条
 const RECALL_THRESHOLD = 0.28  // 相关分低于此值就不注入，省 token
 const MAX_SUMMARY = 160        // 滚动摘要最长字符
-const HARD = new Set(Array.from('。！？!?…\n'))
+const HARD = new Set(Array.from('。！？!?\n'))
 const SOFT = new Set(Array.from('，,；;、：:'))
 
 // ---------- 落盘 ----------
@@ -177,6 +178,33 @@ function mergeByKey(existing, incoming) {
     if (!seen.has(key)) { seen.add(key); out.push(m) }
   }
   return out
+}
+
+// 把聊天里发的图片存成文件，返回 hash（聊天记录里只存 hash）
+function saveImage(dataUrl) {
+  try {
+    const m = String(dataUrl).match(/^data:(image\/[a-z0-9.+-]+);base64,([\s\S]+)$/i)
+    if (!m) return ''
+    const mime = m[1].toLowerCase()
+    const ext = mime.includes('png') ? 'png' : mime.includes('webp') ? 'webp' : mime.includes('gif') ? 'gif' : 'jpg'
+    const buf = Buffer.from(m[2], 'base64')
+    const hash = createHash('sha256').update(String(dataUrl)).digest('hex')
+    mkdirSync(IMAGES_URL, { recursive: true })
+    writeFileSync(new URL(`${hash}.${ext}`, IMAGES_URL), buf)
+    return hash
+  } catch { return '' }
+}
+
+function imageFile(hash) {
+  const h = String(hash || '').replace(/[^a-f0-9]/gi, '')
+  if (!/^[a-f0-9]{64}$/i.test(h)) return null
+  for (const ext of ['jpg', 'png', 'webp', 'gif']) {
+    try {
+      const url = new URL(`${h}.${ext}`, IMAGES_URL)
+      if (existsSync(url)) return { url, type: ext === 'jpg' ? 'image/jpeg' : `image/${ext}` }
+    } catch {}
+  }
+  return null
 }
 
 function saveThread(body) {
@@ -281,11 +309,24 @@ class Splitter {
     this.buf = ''
     this.soft = soft
     this.hard = hard
+    this.pendingEllipsis = false
   }
   push(text) {
     const out = []
     for (const ch of text) {
+      // 省略号串（……）结束：先把缓冲（含整串 …）发出去，再开始下一句
+      if (this.pendingEllipsis && ch !== '…') {
+        this.pendingEllipsis = false
+        const b = cleanBubble(this.buf)
+        this.buf = ''
+        if (b) out.push(...splitLong(b))
+      }
       this.buf += ch
+      // 遇到省略号先不切，等确认整串结束
+      if (ch === '…') {
+        this.pendingEllipsis = true
+        continue
+      }
       let emit = false
       let cutAt = this.buf.length
       if (HARD.has(ch)) {
@@ -315,6 +356,7 @@ class Splitter {
     return out
   }
   flush() {
+    this.pendingEllipsis = false
     const b = cleanBubble(this.buf)
     this.buf = ''
     return b ? splitLong(b) : []
@@ -780,6 +822,13 @@ async function serveGet(request) {
       return jsonResponse({ error: String((error && error.message) || error).slice(0, 160) }, 500)
     }
   }
+  if (path.startsWith(`${BASE}/img/`)) {
+    const f = imageFile(path.slice(`${BASE}/img/`.length))
+    if (!f) return new Response('not found', { status: 404 })
+    return new Response(readFileSync(f.url), {
+      headers: { 'content-type': f.type, 'cache-control': 'public, max-age=31536000' },
+    })
+  }
   return new Response('not found', { status: 404 })
 }
 
@@ -863,6 +912,11 @@ async function chat(ctx, req, res) {
   const memory = cleanNotes(body && body.notes)
   const full = normMessages(body && body.messages)
   const history = full.slice(-cfg.historyTurns)
+  const imageList = Array.isArray(body && body.images)
+    ? body.images
+    : (body && typeof body.image === 'string' ? [body.image] : [])
+  const validImages = imageList.filter((u) => typeof u === 'string' && u.startsWith('data:image/')).slice(0, 9)
+  const imgHashes = validImages.map((u) => saveImage(u)).filter(Boolean)
 
   // 主动回忆 + 原文回溯
   const mem = loadMemory()
@@ -881,7 +935,7 @@ async function chat(ctx, req, res) {
   req.on('close', () => abort.abort())
 
   openSse(res)
-  sse(res, { type: 'info', provider, model, sent: history.length, limit: cfg.historyTurns })
+  sse(res, { type: 'info', provider, model, sent: history.length, limit: cfg.historyTurns, imgs: imgHashes })
 
   let count = 0
   let tail = ''
@@ -892,11 +946,13 @@ async function chat(ctx, req, res) {
   }
 
   try {
+    const userContent = [{ type: 'text', text: buildTranscript(history) }]
+    for (const u of validImages) userContent.push({ type: 'image_url', image_url: { url: u } })
     const options = {
       provider,
       model,
       system: buildSystem(memory, recallStr, backStr, factsStr),
-      messages: [{ role: 'user', content: [{ type: 'text', text: buildTranscript(history) }] }],
+      messages: [{ role: 'user', content: userContent }],
       temperature: cfg.temperature,
       maxTokens: cfg.maxTokens,
       reasoningEffort: cfg.reasoningEffort,

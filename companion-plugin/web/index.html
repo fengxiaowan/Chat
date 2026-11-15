@@ -24,8 +24,16 @@
   <main id="list" class="list"></main>
 
   <footer>
-    <textarea id="input" rows="1" placeholder="说点什么…" autocomplete="off"></textarea>
-    <button id="send" class="send">发送</button>
+    <div id="preview" class="preview" hidden>
+      <img id="preview-img" alt="预览">
+      <button id="preview-x" class="preview-x" title="移除">✕</button>
+    </div>
+    <div class="compose">
+      <button id="pic" class="pic" title="发图片">🖼</button>
+      <input id="file" type="file" accept="image/*" multiple hidden>
+      <textarea id="input" rows="1" placeholder="说点什么…" autocomplete="off"></textarea>
+      <button id="send" class="send">发送</button>
+    </div>
   </footer>
 </div>
 

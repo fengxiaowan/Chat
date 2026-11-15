@@ -158,12 +158,28 @@
     step();
   }
 
-  function makeBubble(role, text) {
+  function makeBubble(role, text, imgs) {
     const row = document.createElement('div');
     row.className = 'row' + (role === 'user' ? ' mine' : '') + (role === 'err' ? ' err' : '');
     const b = document.createElement('div');
     b.className = 'bubble';
-    b.textContent = text;
+    const list0 = Array.isArray(imgs) ? imgs : (imgs ? [imgs] : []);
+    if (list0.length) {
+      b.classList.add('img-bubble');
+      for (const im of list0) {
+        const el = document.createElement('img');
+        el.className = 'chat-img';
+        el.src = String(im).startsWith('data:') ? String(im) : BASE + '/img/' + im;
+        b.appendChild(el);
+      }
+      if (text) {
+        const t = document.createElement('div');
+        t.textContent = text;
+        b.appendChild(t);
+      }
+    } else {
+      b.textContent = text;
+    }
     if (role === 'assistant') {
       b.classList.add('tts');
       b.title = '点击朗读 / 再点停止';
@@ -172,9 +188,9 @@
     row.appendChild(b);
     return row;
   }
-  function addBubble(role, text) {
+  function addBubble(role, text, img) {
     hideTyping();
-    const row = makeBubble(role, text);
+    const row = makeBubble(role, text, img);
     list.appendChild(row);
     scrollBottom();
     return row.querySelector('.bubble');
@@ -214,7 +230,7 @@
     list.innerHTML = '';
     if (S.history.length) {
       addDivider(stamp());
-      for (const m of S.history) list.appendChild(makeBubble(m.role, m.content));
+      for (const m of S.history) list.appendChild(makeBubble(m.role, m.content, m.imgs || m.img));
       scrollBottom();
     }
     updateUsage();
@@ -304,22 +320,114 @@
     }
   }
 
+  // ---------- 发图片（支持多张）----------
+  let pendingImages = [];
+  function compressImage(file) {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const img = new Image();
+        img.onload = () => {
+          const max = 1024;
+          let w = img.width, h = img.height;
+          if (w > max || h > max) {
+            if (w > h) { h = Math.round(h * max / w); w = max; }
+            else { w = Math.round(w * max / h); h = max; }
+          }
+          const canvas = document.createElement('canvas');
+          canvas.width = w; canvas.height = h;
+          canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+          resolve(canvas.toDataURL('image/jpeg', 0.8));
+        };
+        img.onerror = () => resolve(String(reader.result || ''));
+        img.src = String(reader.result || '');
+      };
+      reader.onerror = () => resolve('');
+      reader.readAsDataURL(file);
+    });
+  }
+  function renderPreviews() {
+    const box = $('preview');
+    if (!box) return;
+    box.innerHTML = '';
+    if (!pendingImages.length) { box.hidden = true; return; }
+    box.hidden = false;
+    pendingImages.forEach((url, i) => {
+      const item = document.createElement('div');
+      item.className = 'preview-item';
+      const im = document.createElement('img');
+      im.src = url;
+      const x = document.createElement('button');
+      x.className = 'preview-x';
+      x.textContent = '✕';
+      x.addEventListener('click', () => { pendingImages.splice(i, 1); renderPreviews(); });
+      item.appendChild(im);
+      item.appendChild(x);
+      box.appendChild(item);
+    });
+  }
+  async function addFiles(files) {
+    const list = Array.from(files || []).filter((f) => f && f.type && f.type.startsWith('image/')).slice(0, 9);
+    for (const f of list) {
+      const d = await compressImage(f);
+      if (d) pendingImages.push(d);
+    }
+    renderPreviews();
+  }
+  $('pic').addEventListener('click', () => $('file').click());
+  $('file').addEventListener('change', async () => {
+    await addFiles($('file').files);
+    $('file').value = '';
+  });
+
+  // 粘贴图片（电脑上 Ctrl+V）
+  document.addEventListener('paste', (e) => {
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    const files = [];
+    for (const it of items) {
+      if (it.type && it.type.startsWith('image/')) {
+        const f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length) { e.preventDefault(); addFiles(files); }
+  });
+
+  // 拖拽图片到页面任意位置
+  ['dragenter', 'dragover'].forEach((t) => {
+    document.body.addEventListener(t, (e) => e.preventDefault());
+  });
+  document.body.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    if (e.dataTransfer && e.dataTransfer.files) await addFiles(e.dataTransfer.files);
+  });
+
   // ---------- 发送 ----------
   async function send() {
     const text = input.value.trim();
-    if (!text) return;
+    const images = pendingImages.slice();
+    if (!text && !images.length) return;
     unlockAudio();
     input.value = '';
     autosize();
-    addBubble('user', text);
-    S.history.push({ role: 'user', content: text, ts: Date.now() });
+    if (images.length) {
+      addBubble('user', text, images);
+      const label = text || (images.length > 1 ? `（发了 ${images.length} 张图）` : '（发了张图）');
+      S.history.push({ role: 'user', content: label, ts: Date.now() });
+    } else {
+      addBubble('user', text);
+      S.history.push({ role: 'user', content: text, ts: Date.now() });
+    }
+    pendingImages = [];
+    renderPreviews();
     if (!S.title) S.title = titleOf(S.history);
     scheduleSave(300);
     updateUsage();
-    runTurn(text, false);
+    runTurn(text, false, images);
   }
 
-  async function runTurn(text, isRetry) {
+  async function runTurn(text, isRetry, images) {
     const gen = ++S.gen;
     if (ctrl) ctrl.abort();
     ctrl = new AbortController();
@@ -347,10 +455,12 @@
     armIdle();
 
     try {
+      const payload = { notes: S.notes, messages: S.history };
+      if (images && images.length) payload.images = images;
       const resp = await fetch(BASE + '/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ notes: S.notes, messages: S.history }),
+        body: JSON.stringify(payload),
         signal: ctrl.signal,
       });
       if (!resp.ok || !resp.body) throw new Error('HTTP ' + resp.status);
@@ -373,7 +483,14 @@
             if (evt.type === 'bubble') { got += 1; S.queue.push(evt.text); wake(); armIdle(); }
             else if (evt.type === 'thinking') { armIdle(); }
             else if (evt.type === 'error') { showError(evt.message); }
-            else if (evt.type === 'info') { if (evt.limit) S.limit = evt.limit; updateUsage(); }
+            else if (evt.type === 'info') {
+              if (evt.limit) S.limit = evt.limit;
+              if (evt.imgs && evt.imgs.length) {
+                const last = [...S.history].reverse().find((m) => m.role === 'user');
+                if (last && !last.imgs) { last.imgs = evt.imgs; scheduleSave(300); }
+              }
+              updateUsage();
+            }
           }
         }
       }
@@ -388,7 +505,7 @@
         if (timedOut && got === 0) {
           if (!isRetry) {
             addBubble('assistant', '诶，刚才卡了一下，我重接一下…');
-            setTimeout(() => { if (gen === S.gen) runTurn(text, true); }, 300);
+            setTimeout(() => { if (gen === S.gen) runTurn(text, true, image); }, 300);
           } else {
             addBubble('assistant', '还是没接上，你再说一遍？');
           }

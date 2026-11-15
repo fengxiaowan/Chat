@@ -59,6 +59,8 @@
       const key = (m && m.ts || '') + '|' + (m && m.role) + '|' + (m && m.content);
       if (!seen.has(key)) { seen.add(key); out.push(m); }
     }
+    // 服务器只返回最近一段时，本地更老的消息会被拼到后面；按时间戳重新排好
+    out.sort((a, b) => (Number(a && a.ts) || 0) - (Number(b && b.ts) || 0));
     return out;
   }
   const newId = () => 't-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
@@ -70,6 +72,18 @@
   // ---------- 视图 ----------
   function scrollBottom() {
     requestAnimationFrame(() => { list.scrollTop = list.scrollHeight; });
+  }
+  // 图片是异步加载的，加载完会把内容撑高；只要用户没往上翻，就一直贴在底部
+  let followBottom = true;
+  let lastScrollTop = 0;
+  list.addEventListener('scroll', () => {
+    const t = list.scrollTop;
+    if (t < lastScrollTop - 4) followBottom = false;
+    else if (t > lastScrollTop + 4) followBottom = true;
+    lastScrollTop = t;
+  });
+  function keepBottom() {
+    if (followBottom) scrollBottom();
   }
   function setStatus(text, typing) {
     const el = $('status');
@@ -170,6 +184,8 @@
         const el = document.createElement('img');
         el.className = 'chat-img';
         el.src = String(im).startsWith('data:') ? String(im) : BASE + '/img/' + im;
+        el.addEventListener('load', keepBottom);
+        el.addEventListener('error', keepBottom);
         b.appendChild(el);
       }
       if (text) {
@@ -226,23 +242,47 @@
     return `${d.getMonth() + 1}月${d.getDate()}日 ${hh}:${mm}`;
   }
 
-  function renderAll() {
+  function renderAll(keepScroll) {
+    const prevHeight = list.scrollHeight;
+    const prevTop = list.scrollTop;
     list.innerHTML = '';
+    if (S.total > S.history.length) {
+      const more = document.createElement('div');
+      more.className = 'load-more';
+      more.textContent = '加载更早的聊天';
+      more.addEventListener('click', loadMore);
+      list.appendChild(more);
+    }
     if (S.history.length) {
       addDivider(stamp());
       for (const m of S.history) list.appendChild(makeBubble(m.role, m.content, m.imgs || m.img));
-      scrollBottom();
+      if (keepScroll) { list.scrollTop = list.scrollHeight - prevHeight + prevTop; followBottom = false; }
+      else scrollBottom();
     }
     updateUsage();
+  }
+
+  async function loadMore() {
+    try {
+      const before = S.history.length;
+      const r = await fetch(BASE + '/current?limit=' + (before + 100));
+      if (!r.ok) return;
+      const d = await r.json();
+      if (!d || !Array.isArray(d.messages)) return;
+      S.history = mergeMessages(d.messages, S.history);
+      S.total = d.total || S.total;
+      renderAll(true);
+    } catch {}
   }
 
   function updateUsage() {
     const el = $('usage');
     if (!el) return;
     const n = S.history.length;
+    const t = S.total || n;
     const seen = Math.min(n, S.limit || 26);
     el.textContent = n
-      ? `这段对话 ${n} 条 · 每轮模型看最近 ${seen} 条（上限 ${S.limit || 26}）`
+      ? `已加载 ${n} 条${t > n ? `（这段共 ${t} 条）` : ''} · 每轮模型看最近 ${seen} 条（上限 ${S.limit || 26}）`
       : '还没开始聊';
   }
 
@@ -812,18 +852,21 @@
     const localHist = read(LS.hist, []);
     const localThread = read(LS.thread, '');
     let remote = null;
-    try { remote = await (await fetch(BASE + '/current')).json(); } catch {}
+    try { remote = await (await fetch(BASE + '/current?limit=100')).json(); } catch {}
     const remoteOk = remote && Array.isArray(remote.messages) && remote.messages.length;
 
     if (remoteOk) {
       // 合并服务器和本地（并集），两边都不丢
       S.history = mergeMessages(remote.messages, localHist);
+      if (S.history.length > 160) S.history = S.history.slice(-160);
+      S.total = remote.total || S.history.length;
       S.notes = normalizeNotes(remote.notes);
       S.threadId = remote.threadId;
       S.title = remote.title || '';
       S.createdAt = remote.createdAt;
     } else {
       S.history = localHist;
+      S.total = S.history.length;
       S.notes = normalizeNotes(read(LS.notes, EMPTY_NOTES));
       S.threadId = localThread || newId();
       S.title = S.history.length ? titleOf(S.history) : '';

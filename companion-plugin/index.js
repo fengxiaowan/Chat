@@ -794,7 +794,12 @@ async function serveGet(request) {
   }
   if (path === `${BASE}/current`) {
     const thread = loadCurrent()
-    return jsonResponse(thread || { empty: true })
+    if (!thread) return jsonResponse({ empty: true })
+    const limitParam = parseInt(url.searchParams.get('limit'), 10)
+    const limit = Number.isFinite(limitParam) ? Math.max(20, Math.min(limitParam, 3000)) : 100
+    const all = Array.isArray(thread.messages) ? thread.messages : []
+    const messages = all.slice(-limit)
+    return jsonResponse({ ...thread, messages, total: all.length })
   }
   if (path === `${BASE}/threads`) {
     return jsonResponse({ threads: listThreads() })

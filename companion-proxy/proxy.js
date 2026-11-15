@@ -13,7 +13,7 @@ const http = require('node:http')
 const { execSync } = require('node:child_process')
 
 const LISTEN_PORT = Number(process.env.COMPANION_PROXY_PORT || 8899)
-const LISTEN_HOST = '127.0.0.1'
+const LISTEN_HOST = process.env.COMPANION_PROXY_HOST || '0.0.0.0'
 const PREFIX = '/liao'
 
 let target = null

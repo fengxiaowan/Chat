@@ -46,6 +46,21 @@
     }
     return out;
   }
+  // 两个设备各自的本地记录取并集，避免后保存的一方覆盖另一方
+  function mergeMessages(server, local) {
+    const seen = new Set();
+    const out = [];
+    for (const m of (Array.isArray(server) ? server : [])) {
+      const key = (m && m.ts || '') + '|' + (m && m.role) + '|' + (m && m.content);
+      seen.add(key);
+      out.push(m);
+    }
+    for (const m of (Array.isArray(local) ? local : [])) {
+      const key = (m && m.ts || '') + '|' + (m && m.role) + '|' + (m && m.content);
+      if (!seen.has(key)) { seen.add(key); out.push(m); }
+    }
+    return out;
+  }
   const newId = () => 't-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
   const titleOf = (h) => {
     const first = (h || []).find((m) => m.role === 'user');
@@ -135,6 +150,13 @@
     clearTimeout(saveTimer);
     if (!S.threadId) S.threadId = newId();
     if (!S.title && S.history.length) S.title = titleOf(S.history);
+    // 先拉服务器，合并（并集），避免两个设备互相覆盖
+    try {
+      const cur = await (await fetch(BASE + '/current')).json();
+      if (cur && Array.isArray(cur.messages) && cur.threadId === S.threadId && cur.messages.length) {
+        S.history = mergeMessages(cur.messages, S.history);
+      }
+    } catch {}
     const payload = {
       threadId: S.threadId,
       title: S.title,
@@ -203,9 +225,11 @@
     if (!S.title) S.title = titleOf(S.history);
     scheduleSave(300);
     updateUsage();
+    runTurn(text, false);
+  }
 
-    S.gen += 1;
-    const gen = S.gen;
+  async function runTurn(text, isRetry) {
+    const gen = ++S.gen;
     if (ctrl) ctrl.abort();
     ctrl = new AbortController();
     hideTyping();
@@ -218,17 +242,19 @@
     pump(gen);
 
     let got = 0;
-    // 无进展超时：模型流偶尔会卡住不结束，导致 done 永远不来、页面挂起。
-    // 超时后主动 abort 本轮，已收到的气泡保留，不弹错误。
+    let timedOut = false;
     let idleTimer = null;
+    const timeoutMs = isRetry ? 30000 : 15000;
     const armIdle = () => {
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         if (gen !== S.gen) return;
+        timedOut = true;
         try { ctrl.abort(); } catch {}
-      }, 60000);
+      }, timeoutMs);
     };
     armIdle();
+
     try {
       const resp = await fetch(BASE + '/chat', {
         method: 'POST',
@@ -254,6 +280,7 @@
             try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
             if (gen !== S.gen) return;
             if (evt.type === 'bubble') { got += 1; S.queue.push(evt.text); wake(); armIdle(); }
+            else if (evt.type === 'thinking') { armIdle(); }
             else if (evt.type === 'error') { showError(evt.message); }
             else if (evt.type === 'info') { if (evt.limit) S.limit = evt.limit; updateUsage(); }
           }
@@ -264,7 +291,18 @@
     } finally {
       clearTimeout(kick);
       clearTimeout(idleTimer);
-      if (gen === S.gen) { S.done = true; wake(); }
+      if (gen === S.gen) {
+        S.done = true;
+        wake();
+        if (timedOut && got === 0) {
+          if (!isRetry) {
+            addBubble('assistant', '诶，刚才卡了一下，我重接一下…');
+            setTimeout(() => { if (gen === S.gen) runTurn(text, true); }, 300);
+          } else {
+            addBubble('assistant', '还是没接上，你再说一遍？');
+          }
+        }
+      }
       if (got > 0 && gen === S.gen) updateNotes();
     }
   }
@@ -531,15 +569,9 @@
     try { remote = await (await fetch(BASE + '/current')).json(); } catch {}
     const remoteOk = remote && Array.isArray(remote.messages) && remote.messages.length;
 
-    if (remoteOk && remote.threadId === localThread && localHist.length > remote.messages.length) {
-      // 本地比磁盘新（多半是刷新打断了自动保存），以本地为准，马上补存
-      S.history = localHist;
-      S.notes = normalizeNotes(read(LS.notes, remote.notes));
-      S.threadId = localThread;
-      S.title = remote.title || titleOf(localHist);
-      S.createdAt = remote.createdAt;
-    } else if (remoteOk) {
-      S.history = remote.messages;
+    if (remoteOk) {
+      // 合并服务器和本地（并集），两边都不丢
+      S.history = mergeMessages(remote.messages, localHist);
       S.notes = normalizeNotes(remote.notes);
       S.threadId = remote.threadId;
       S.title = remote.title || '';
@@ -562,5 +594,6 @@
     scheduleSave(200);
     autosize();
     input.focus();
+    try { const el = $('ver'); if (el) el.textContent = 'v20261115c'; } catch {}
   })();
 })();

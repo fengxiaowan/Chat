@@ -105,19 +105,39 @@ function normMessages(list) {
     .slice(-MAX_STORED_MESSAGES)
 }
 
+function mergeByKey(existing, incoming) {
+  const seen = new Set()
+  const out = []
+  for (const m of (Array.isArray(existing) ? existing : [])) {
+    const key = (m && m.ts || '') + '|' + (m && m.role) + '|' + (m && m.content)
+    seen.add(key)
+    out.push(m)
+  }
+  for (const m of (Array.isArray(incoming) ? incoming : [])) {
+    const key = (m && m.ts || '') + '|' + (m && m.role) + '|' + (m && m.content)
+    if (!seen.has(key)) { seen.add(key); out.push(m) }
+  }
+  return out
+}
+
 function saveThread(body) {
   ensureDirs()
-  const messages = normMessages(body && body.messages)
+  const incoming = normMessages(body && body.messages)
+  const threadId = safeId(body && body.threadId) || 'thread-' + Date.now()
+  const existing = readJsonUrl(threadUrl(threadId), null)
+  const existingMessages = (existing && Array.isArray(existing.messages)) ? existing.messages : []
+  // 服务器端合并：保留已有 + 追加新消息，后保存的一方不会再覆盖另一方
+  const merged = mergeByKey(existingMessages, incoming)
   const thread = {
-    threadId: safeId(body && body.threadId) || 'thread-' + Date.now(),
-    title: String((body && body.title) || '').slice(0, 40) || '未命名',
+    threadId,
+    title: String((body && body.title) || (existing && existing.title) || '').slice(0, 40) || '未命名',
     notes: cleanNotes(body && body.notes),
-    messages,
-    createdAt: String((body && body.createdAt) || new Date().toISOString()),
+    messages: merged,
+    createdAt: String((body && body.createdAt) || (existing && existing.createdAt) || new Date().toISOString()),
     updatedAt: new Date().toISOString(),
   }
-  writeJsonUrl(threadUrl(thread.threadId), thread)
-  writeJsonUrl(CURRENT_URL, { threadId: thread.threadId })
+  writeJsonUrl(threadUrl(threadId), thread)
+  writeJsonUrl(CURRENT_URL, { threadId })
   return thread
 }
 
@@ -707,9 +727,17 @@ async function chat(ctx, req, res) {
       reasoningEffort: cfg.reasoningEffort,
       signal: abort.signal,
     }
+    let lastThink = 0
     for await (const chunk of ctx.llm.stream(options)) {
       if (isText(chunk)) {
         for (const b of splitter.push(chunk.text)) emit(b)
+      } else if (chunk && chunk.type === 'reasoning-delta') {
+        // 心跳：真正在思考时，前端据此延长超时，别误判为卡死
+        const now = Date.now()
+        if (now - lastThink > 800) {
+          lastThink = now
+          sse(res, { type: 'thinking' })
+        }
       } else if (chunk && chunk.type === 'finish' && chunk.reason && chunk.reason.kind === 'error') {
         sse(res, { type: 'error', message: (chunk.reason.failure && chunk.reason.failure.message) || '模型出错了' })
       }

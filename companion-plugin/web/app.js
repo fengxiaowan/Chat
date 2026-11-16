@@ -11,6 +11,8 @@
     thread: 'companion.thread.v1',
   };
   const EMPTY_NOTES = { about_you: [], how_to_talk: [], between_us: [], about_me: [] };
+  // 本地缓存多少条：够翻一段历史，又不至于把 localStorage 撑爆
+  const CACHE_MAX = 600;
 
   const S = {
     history: [],
@@ -97,6 +99,38 @@
   let ttsQueueActive = false;
   let autoPlay = read('companion.autoplay', false);
 
+  // ---------- 语音预取 ----------
+  // 目的：气泡还在「逐字打」的同时就把语音生成好，出声不用再等 1.2~1.6 秒。
+  // 做法：拿到一句文本立刻发起请求，把 blob 存进 ttsPrefetch，播放时直接用。
+  const ttsPrefetch = new Map();
+  function prefetchTts(text) {
+    const key = String(text || '').trim();
+    if (!key || ttsPrefetch.has(key)) return;
+    ttsPrefetch.set(key, null); // 占位，避免重复请求
+    try {
+      const url = BASE + '/tts?text=' + encodeURIComponent(key);
+      fetch(url, { credentials: 'same-origin' })
+        .then((r) => (r.ok ? r.blob() : null))
+        .then((blob) => {
+          if (blob && blob.size > 0) {
+            ttsPrefetch.set(key, URL.createObjectURL(blob));
+            // 防止无限增长：超过 60 条就丢掉最早的
+            if (ttsPrefetch.size > 60) {
+              for (const [k, v] of ttsPrefetch) {
+                if (ttsPrefetch.size <= 45) break;
+                if (typeof v === 'string') URL.revokeObjectURL(v);
+                ttsPrefetch.delete(k);
+              }
+            }
+          } else {
+            ttsPrefetch.delete(key);
+          }
+          kickPump();
+        })
+        .catch(() => { ttsPrefetch.delete(key); kickPump(); });
+    } catch { ttsPrefetch.delete(key); }
+  }
+
   // 单例 audio：解锁一次，之后换 src 复用（新 Audio 每次都会被拦）
   function getAudio() {
     if (!ttsAudio) {
@@ -146,14 +180,49 @@
     if (playingEl) playingEl.classList.add('playing');
     playEndCb = onEnd || null;
     a.muted = false;
-    a.src = BASE + '/tts?text=' + encodeURIComponent(text);
+    const key = String(text || '').trim();
+    const ready = ttsPrefetch.get(key);
+    if (typeof ready === 'string') {
+      // 预取好了：本地 blob，零网络等待
+      a.src = ready;
+      a.play().catch(() => { finishPlay(); });
+      return;
+    }
+    // 还没预取完，先等它（此时通常只差一点点）
+    if (ttsPrefetch.has(key)) {
+      waitPrefetch(key, (blobUrl) => {
+        if (playingEl !== (bubbleEl || null)) return; // 期间被停掉了
+        if (blobUrl) {
+          a.src = blobUrl;
+          a.play().catch(() => { finishPlay(); });
+        } else {
+          a.src = BASE + '/tts?text=' + encodeURIComponent(key);
+          a.play().catch(() => { finishPlay(); });
+        }
+      });
+      return;
+    }
+    a.src = BASE + '/tts?text=' + encodeURIComponent(key);
     a.play().catch(() => { finishPlay(); });
+  }
+  // 等某句的预取结果（最多等 4 秒，超时就用普通请求）
+  function waitPrefetch(key, cb) {
+    const t0 = Date.now();
+    const tick = () => {
+      const v = ttsPrefetch.get(key);
+      if (typeof v === 'string') return cb(v);
+      if (!ttsPrefetch.has(key)) return cb(null);
+      if (Date.now() - t0 > 4000) return cb(null);
+      setTimeout(tick, 40);
+    };
+    tick();
   }
   function toggleBubble(text, bubbleEl) {
     if (playingEl === bubbleEl && ttsAudio && !ttsAudio.paused) {
       stopAllTts();
     } else {
       stopAllTts();
+      prefetchTts(text);   // 手动点读也走预取（多半已缓存，只剩 2ms）
       playOne(text, bubbleEl);
     }
   }
@@ -234,6 +303,7 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   function wake() { if (S.wake) { const r = S.wake; S.wake = null; r(); } }
   function waitWake() { return new Promise((r) => { S.wake = r; }); }
+  function kickPump() { if (S.idx < S.queue.length) wake(); }
 
   function stamp() {
     const d = new Date();
@@ -316,7 +386,7 @@
         body: JSON.stringify(payload),
       });
     } catch {}
-    write(LS.hist, S.history);
+    write(LS.hist, S.history.slice(-CACHE_MAX));
     write(LS.notes, S.notes);
     write(LS.thread, S.threadId);
   }
@@ -520,7 +590,7 @@
             let evt;
             try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
             if (gen !== S.gen) return;
-            if (evt.type === 'bubble') { got += 1; S.queue.push(evt.text); wake(); armIdle(); }
+            if (evt.type === 'bubble') { got += 1; S.queue.push(evt.text); if (autoPlay) prefetchTts(evt.text); wake(); armIdle(); }
             else if (evt.type === 'thinking') { armIdle(); }
             else if (evt.type === 'error') { showError(evt.message); }
             else if (evt.type === 'info') {
@@ -535,7 +605,15 @@
         }
       }
     } catch (e) {
-      if (e.name !== 'AbortError' && gen === S.gen) showError('连不上：' + e.message);
+      if (e.name !== 'AbortError' && gen === S.gen) {
+        if (isNetworkError(e) && got === 0) {
+          // 断网：不弹死错，进入自动重连，等网络回来把这句话补发出去
+          markOffline();
+          pendingResend = () => { if (gen === S.gen) runTurn(text, isRetry, images); };
+        } else {
+          showError('连不上：' + e.message);
+        }
+      }
     } finally {
       clearTimeout(kick);
       clearTimeout(idleTimer);
@@ -545,7 +623,7 @@
         if (timedOut && got === 0) {
           if (!isRetry) {
             addBubble('assistant', '诶，刚才卡了一下，我重接一下…');
-            setTimeout(() => { if (gen === S.gen) runTurn(text, true, image); }, 300);
+            setTimeout(() => { if (gen === S.gen) runTurn(text, true, images); }, 300);
           } else {
             addBubble('assistant', '还是没接上，你再说一遍？');
           }
@@ -584,6 +662,86 @@
     list.appendChild(makeBubble('err', msg));
     scrollBottom();
   }
+
+  // ---------- 断线自动重连 ----------
+  // 背景：手机走 Tailscale 中继（常经香港），网络一抖动就 Failed to fetch。
+  // 做法：探活失败不弹死错，先静默重试；恢复后自动把没发出去的那句补发。
+  let netDown = false;        // 当前是否认为断网
+  let probeTimer = null;      // 重试定时器
+  let probeDelay = 0;         // 当前退避间隔
+  let pendingResend = null;   // 断线时没发出去的消息
+
+  function isNetworkError(e) {
+    if (!e) return false;
+    const m = String(e.message || e);
+    return e.name === 'TypeError' || /Failed to fetch|NetworkError|load failed|timeout|The operation was aborted/i.test(m);
+  }
+
+  function markOnline() {
+    if (!netDown) return;
+    netDown = false;
+    probeDelay = 0;
+    if (probeTimer) { clearTimeout(probeTimer); probeTimer = null; }
+    setStatus('网络回来了', false);
+    setTimeout(() => { if (!netDown) setStatus('', false); }, 1600);
+    // 把断线期间没发出去的那句补发
+    if (pendingResend) {
+      const job = pendingResend;
+      pendingResend = null;
+      setTimeout(() => { try { job(); } catch {} }, 200);
+    } else {
+      // 没有待补发的，就静默补拉一次历史，把断线期间别处发的内容并进来
+      setTimeout(() => { try { syncFromServer(); } catch {} }, 300);
+    }
+  }
+
+  async function syncFromServer() {
+    if (netDown) return;
+    try {
+      const cur = await (await fetch(BASE + '/current?limit=300', { cache: 'no-store' })).json();
+      if (!cur || !Array.isArray(cur.messages) || !cur.messages.length) return;
+      if (cur.threadId && cur.threadId !== S.threadId) return;
+      const merged = mergeMessages(cur.messages, S.history);
+      if (merged.length === S.history.length) return; // 没变化，别重绘
+      S.history = merged.length > CACHE_MAX ? merged.slice(-CACHE_MAX) : merged;
+      S.total = cur.total || S.history.length;
+      write(LS.hist, S.history.slice(-CACHE_MAX));
+      renderAll();
+      updateUsage();
+    } catch {}
+  }
+
+  function markOffline() {
+    netDown = true;
+    if (probeTimer) return; // 已经在重试循环里
+    probeDelay = 0;
+    scheduleProbe();
+  }
+
+  function scheduleProbe() {
+    if (!netDown) return;
+    // 退避：1s → 2s → 3s → 5s，然后一直 5s
+    probeDelay = probeDelay === 0 ? 1000 : Math.min(probeDelay + 1000, 5000);
+    setStatus('网络断了，正在重连…', false);
+    probeTimer = setTimeout(runProbe, probeDelay);
+  }
+
+  async function runProbe() {
+    probeTimer = null;
+    if (!netDown) return;
+    try {
+      const ctl = new AbortController();
+      const to = setTimeout(() => ctl.abort(), 4000);
+      const r = await fetch(BASE + '/info', { cache: 'no-store', signal: ctl.signal });
+      clearTimeout(to);
+      if (r.ok) { markOnline(); return; }
+    } catch {}
+    scheduleProbe();
+  }
+
+  // 浏览器自己报网络恢复时，立刻探一次（不用等退避）
+  window.addEventListener('online', () => { if (netDown) { probeDelay = 0; runProbe(); } });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && netDown) { probeDelay = 0; runProbe(); } });
 
   // ---------- 记忆展示 ----------
   const MEM_LABELS = [
@@ -848,42 +1006,72 @@
   });
 
   // ---------- 启动 ----------
-  (async function boot() {
+  (function boot() {
+    // 先用本地缓存立刻上屏，绝不等网络。手机上走 Tailscale 拉一次要好几百毫秒到几秒，
+    // 干等着就是那个「空白聊天窗口」。
     const localHist = read(LS.hist, []);
-    const localThread = read(LS.thread, '');
-    let remote = null;
-    try { remote = await (await fetch(BASE + '/current?limit=100')).json(); } catch {}
-    const remoteOk = remote && Array.isArray(remote.messages) && remote.messages.length;
-
-    if (remoteOk) {
-      // 合并服务器和本地（并集），两边都不丢
-      S.history = mergeMessages(remote.messages, localHist);
-      if (S.history.length > 160) S.history = S.history.slice(-160);
-      S.total = remote.total || S.history.length;
-      S.notes = normalizeNotes(remote.notes);
-      S.threadId = remote.threadId;
-      S.title = remote.title || '';
-      S.createdAt = remote.createdAt;
-    } else {
-      S.history = localHist;
-      S.total = S.history.length;
-      S.notes = normalizeNotes(read(LS.notes, EMPTY_NOTES));
-      S.threadId = localThread || newId();
-      S.title = S.history.length ? titleOf(S.history) : '';
-    }
-    if (!S.threadId) S.threadId = newId();
+    const localThread = read(LS.thread, '');    S.history = Array.isArray(localHist) ? localHist : [];
+    S.total = S.history.length;
+    S.notes = normalizeNotes(read(LS.notes, EMPTY_NOTES));
+    S.threadId = localThread || newId();
+    S.title = S.history.length ? titleOf(S.history) : '';
     renderAll();
     renderMem();
-    try {
-      const info = await (await fetch(BASE + '/info')).json();
-      if (info && info.historyTurns) S.limit = info.historyTurns;
-      if (info && info.model) S.model = info.model;
-      syncModelUI();
-      updateUsage();
-    } catch {}
-    scheduleSave(200);
     autosize();
+    try { const el = $('ver'); if (el) el.textContent = 'v20261116e'; } catch {}
+
+    // 缓存里的东西先给用户用起来，剩下的在后台补
+    let painted = S.history.length > 0;
+    const firstPaint = () => {
+      if (painted) return;
+      painted = true;
+      renderAll();
+    };
+    // 本地一条都没有时，别让页面干瞪眼：给个「正在读取」的提示
+    if (!painted) setStatus('读取中…', false);
+
+    (async () => {
+      let remote = null;
+      try {
+        remote = await (await fetch(BASE + '/current?limit=300')).json();
+      } catch {
+        // 首屏断网：先显示本地记录，并进入自动重连循环，网络一恢复就补齐
+        if (!painted) setStatus('连不上，先看本地的', false);
+        firstPaint();
+        markOffline();
+        return;
+      }
+      const remoteOk = remote && Array.isArray(remote.messages) && remote.messages.length;
+
+      if (remoteOk) {
+        // 合并服务器和本地（并集），两边都不丢
+        const merged = mergeMessages(remote.messages, localHist);
+        S.history = merged.length > CACHE_MAX ? merged.slice(-CACHE_MAX) : merged;
+        S.total = remote.total || S.history.length;
+        S.notes = normalizeNotes(remote.notes);
+        S.threadId = remote.threadId || S.threadId;
+        S.title = remote.title || S.title;
+        S.createdAt = remote.createdAt;
+        write(LS.thread, S.threadId);
+        write(LS.hist, S.history.slice(-CACHE_MAX));
+        write(LS.notes, S.notes);
+        renderAll();
+        renderMem();
+      } else if (!painted) {
+        renderAll();
+        renderMem();
+      }
+      setStatus('', false);
+      scheduleSave(200);
+      try {
+        const info = await (await fetch(BASE + '/info')).json();
+        if (info && info.historyTurns) S.limit = info.historyTurns;
+        if (info && info.model) S.model = info.model;
+        syncModelUI();
+        updateUsage();
+      } catch {}
+    })();
+
     input.focus();
-    try { const el = $('ver'); if (el) el.textContent = 'v20261115c'; } catch {}
   })();
 })();

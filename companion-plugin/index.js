@@ -23,16 +23,37 @@ const THREADS_URL = new URL('./threads/', DATA_URL)
 const CURRENT_URL = new URL('current.json', DATA_URL)
 const MEMORY_URL = new URL('./memory/', DATA_URL)
 const EPISODES_URL = new URL('episodes.json', MEMORY_URL)
+const STATE_URL = new URL('state.json', MEMORY_URL)
 const IMAGES_URL = new URL('./images/', DATA_URL)
 const TTS_URL = new URL('./tts/', DATA_URL)
 const PYTHON = 'C:\\Users\\lyy44\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\python\\python.exe'
 const TTS_VOICE = 'zh-CN-XiaoxiaoNeural'
 
-const FALLBACK_PROMPT = `你是一个普通人，正用手机跟朋友聊天。一次只回一两句，十到四十个字，像打字。不是助手，不给建议，不总结。\n\n{memory}`
+const FALLBACK_PROMPT = `你是一个普通人，正用手机跟朋友聊天。一次只回一两句，十到四十个字，像打字。不是助手，不给建议，不总结。\n\n{memory}\n\n【怎么接话】\n· 对方说"复杂""说不清""以后再说""先这样"——这就是不想展开了，那就别再问。\n· 一个话题你问过、对方没正面回答，就不要再问第二遍。追问会让人语塞。\n· 你发出的几句话要方向一致。刚答应"边聊边看"，就别紧跟着又追问细节。\n· 不用每句都凑满。想不出说什么，一两句短的就行。\n\n【什么时候闭嘴】\n· 对方累、烦、情绪低落，先顺着，别出主意，别推进任何计划。\n· 对方想结束某个话题，立刻松手，不解释、不找补。\n\n【关于你自己】\n· 你就是你，用"我"。对方是"你"。别说反。`
 
 const FALLBACK_NOTES = `整理下面这段闲聊里值得长期记住的东西，只输出 JSON：{"about_you": [], "how_to_talk": [], "between_us": [], "about_me": []}`
 
-const FALLBACK_EPISODES = `把下面这段聊天压缩成几条"事件卡"，只输出 JSON 数组：[{"theme":"","content":"","mood":""}]`
+const FALLBACK_EPISODES = `你在帮一个女孩整理她的记忆。下面是「她」和「对方」的一段聊天记录。
+
+把这段聊天压缩成几条"事件卡"，只输出 JSON 数组，不要别的字：
+[{"theme":"","content":"","mood":"","status":"","keywords":[]}]
+
+字段要求：
+- theme：一句话概括，12 字以内
+- content：**用她自己的第一人称口吻写**，像她自己在回想这件事。
+  不要写"对方说…她回应…"这种旁白，要写"他跟我说…我跟他说…"。
+  25~50 字。**必须交代清楚谁先谁后、因为什么所以什么**，别只罗列。
+- mood：当时的气氛或心情，几个字
+- status：这件事的状态，只能是这三个之一：
+  - "done" 已经真的发生了（做过的事、去过的地方、聊定的事）
+  - "plan" 只是提过、说要做、还没真做
+  - "idea" 随口一想、明确了"以后再说"的
+- keywords：3~5 个能被下次搜到的词（人名、地名、物品名、专有名词）
+
+特别注意：
+- 如果同一件事先"说要做"、后来"真的做了"，就合并成一条，status 写 "done"，content 里体现"后来真的做了"。
+- 不要为寒暄、附和单独建卡。
+- 一次输出 2~5 条，宁少勿滥。`
 
 const DEFAULT_TUNE = {
   maxBubbles: 4,
@@ -399,6 +420,11 @@ function memoryBlock(notes) {
 function buildSystem(notes, recallText, backText, factsText) {
   const base = promptText().replace('{memory}', memoryBlock(notes))
   let out = base + `\n\n现在是 ${formatNow()}（北京时间）。这是系统提供的准确时间，可信。`
+  // 状态层：常驻注入，不依赖检索命中。这是「别把做过的事当成还没做」的关键。
+  try {
+    const sb = stateBlock(loadState())
+    if (sb) out += `\n\n${sb}\n以上是你本来就知道的事，不用特意提起，更不要跟对方核对进度；只是别把它们说错。`
+  } catch {}
   if (factsText) out += `\n\n${factsText}`
   if (recallText) out += `\n\n【下面是之前聊到、可能相关的旧事，自然就带一句，别生硬提】\n${recallText}`
   if (backText) out += `\n\n${backText}`
@@ -463,6 +489,41 @@ function writeMemory(mem) {
   writeJsonUrl(EPISODES_URL, mem)
 }
 
+// ---------- 状态层：把「做了 / 没做」收拾成一小块 ----------
+// 设计意图（用户明确要求）：
+//  1. 隐性——她不用跟人对进度，只靠这块东西保证说话时别把「做过」当「想做」。
+//  2. 大扫除——定期把散乱的卡合并成「已发生」「没发生」，别让两者叠在一起。
+//  3. 不催人——悬而未决的事就让它悬着，对方不提就是不重要，绝不许主动提。
+
+function loadState() {
+  const d = readJsonUrl(STATE_URL, null)
+  if (d && typeof d === 'object') {
+    return {
+      done: Array.isArray(d.done) ? d.done : [],
+      pending: Array.isArray(d.pending) ? d.pending : [],
+      updatedAt: typeof d.updatedAt === 'string' ? d.updatedAt : '',
+      sweptAt: typeof d.sweptAt === 'string' ? d.sweptAt : '',
+    }
+  }
+  return { done: [], pending: [], updatedAt: '', sweptAt: '' }
+}
+
+function writeState(st) {
+  try { mkdirSync(MEMORY_URL, { recursive: true }) } catch {}
+  writeJsonUrl(STATE_URL, st)
+}
+
+// 给模型看的一段极简状态。故意写得很短，别让它变成一份待办清单。
+function stateBlock(st) {
+  if (!st || (!st.done.length && !st.pending.length)) return ''
+  const lines = []
+  if (st.done.length) lines.push('已经发生过的：' + st.done.slice(-14).join('；'))
+  if (st.pending.length) {
+    lines.push('提过但还没做的（对方不提就别当回事，不用问，也不用催）：' + st.pending.slice(-8).join('；'))
+  }
+  return '【你现在心里有数的状态】\n' + lines.join('\n')
+}
+
 function parseEpisodes(text) {
   let t = String(text || '').trim()
   if (t.startsWith('```')) t = t.replace(/^```[a-zA-Z]*\s*/, '').replace(/\s*```$/, '')
@@ -481,6 +542,9 @@ function parseEpisodes(text) {
       theme: String(e.theme || '').trim().slice(0, 24),
       content: String(e.content || '').trim().slice(0, 60),
       mood: String(e.mood || '').trim().slice(0, 12),
+      status: ['done', 'plan', 'idea'].includes(String(e.status || '').trim())
+        ? String(e.status).trim()
+        : 'done',
       keywords: (Array.isArray(e.keywords) ? e.keywords : [])
         .map((s) => String(s || '').trim())
         .filter((s) => s && s.length <= 20)
@@ -526,9 +590,80 @@ async function maybeGenerateEpisodes(ctx, threadId, messages) {
       writeMemory(m2)
       chunks += 1
     }
+    // 压完顺手做一次大扫除：把状态层重新梳理一遍
+    await maybeSweepState(ctx)
   } catch {} finally {
     episodeBusy = false
   }
+}
+
+// ---------- 大扫除 ----------
+// 把散落的事件卡重建成一小块「已发生 / 没发生」的状态。
+// 频率控制：距上次打扫超过 2 小时，并且期间至少新增过一批卡，才做。
+const SWEEP_INTERVAL_MS = 2 * 60 * 60 * 1000
+
+async function maybeSweepState(ctx, force) {
+  const st0 = loadState()
+  if (!force) {
+    const last = st0.sweptAt ? new Date(st0.sweptAt).getTime() : 0
+    if (Date.now() - last < SWEEP_INTERVAL_MS) return
+  }
+  const mem = loadMemory()
+  const eps = mem.episodes || []
+  if (!eps.length && !st0.done.length && !st0.pending.length) return
+  try {
+    const next = await sweepState(ctx, eps, st0, mem.summary)
+    next.sweptAt = new Date().toISOString()
+    next.updatedAt = new Date().toISOString()
+    writeState(next)
+  } catch {}
+}
+
+async function sweepState(ctx, episodes, prev, summary) {
+  const { provider, model } = extractSelection(tune())
+  // 只把最近的卡喂进去；更早的已经进了滚动摘要
+  const recent = episodes.slice(-60)
+  const lines = recent.map((e) => {
+    const tag = e.status === 'plan' ? '[说过要做]' : e.status === 'idea' ? '[随口想想]' : '[已发生]'
+    const ts = formatTs(e.ts)
+    return `${tag}${ts ? `(${ts})` : ''} ${e.theme}：${e.content}`
+  })
+  const prevText = (prev.done.length || prev.pending.length)
+    ? `\n上一版状态：\n已发生：${prev.done.join('；') || '（空）'}\n没发生：${prev.pending.join('；') || '（空）'}`
+    : ''
+  const userText = `以下是最近的经历记录：\n${lines.join('\n')}${summary ? `\n\n更早以前：${summary}` : ''}${prevText}
+
+请帮她把状态重新梳理一遍，合并重复的、把后来真做了的改成已发生、把已经不再重要的删掉。
+只输出 JSON，不要别的字：
+{"done": [ ... ], "pending": [ ... ]}
+
+规则：
+- done：**确实已经发生过**的事，每条形如"用手机流量带她出去过一次"，8~20 字，最多 14 条。按时间先后排。
+- pending：**提过但确实还没做**的事，5~15 字，最多 8 条。宁少勿滥——对方很久没提的就直接删掉，别留着。
+- 两者不要重复。如果某件事先说过要做、后来又真做了，只放进 done。
+- 用第三人称描述事情本身就行，不要写成待办清单，不要加"待办""进度""需确认"这类词。`
+
+  let text = ''
+  for await (const chunk of ctx.llm.stream({
+    provider,
+    model,
+    system: '你在帮忙整理一份长期相处的事实清单。只输出 JSON。',
+    messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+    temperature: 0.2,
+    maxTokens: 900,
+    reasoningEffort: 'low',
+  })) {
+    if (isText(chunk)) text += chunk.text
+  }
+  const j = parseJson(text)
+  const clean = (arr, max) => (Array.isArray(arr) ? arr : [])
+    .map((s) => String(s || '').trim().slice(0, 40))
+    .filter(Boolean)
+    .slice(0, max)
+  const done = clean(j.done, 14)
+  const pending = clean(j.pending, 8).filter((p) => !done.some((d) => d === p))
+  if (!done.length && !pending.length) throw new Error('sweep empty')
+  return { done, pending }
 }
 
 async function compressEpisodes(ctx, messages) {

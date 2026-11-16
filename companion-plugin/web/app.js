@@ -592,7 +592,7 @@
             if (gen !== S.gen) return;
             if (evt.type === 'bubble') { got += 1; S.queue.push(evt.text); if (autoPlay) prefetchTts(evt.text); wake(); armIdle(); }
             else if (evt.type === 'thinking') { armIdle(); }
-            else if (evt.type === 'error') { showError(evt.message); }
+            else if (evt.type === 'error') { showError(evt.message, !!evt.quota); }
             else if (evt.type === 'info') {
               if (evt.limit) S.limit = evt.limit;
               if (evt.imgs && evt.imgs.length) {
@@ -657,8 +657,17 @@
     }
   }
 
-  function showError(msg) {
+  function showError(msg, isQuota) {
     hideTyping();
+    if (isQuota) {
+      // 日卡额度耗尽：用她的口吻提示，别用冷冰冰的报错
+      const row = makeBubble('err', '猫粮吃完啦，我这边断粮了 (´｡• ᵕ •｡) 去续一下再接着聊～');
+      const el = row.querySelector('.bubble');
+      if (el) el.classList.add('quota-bubble');
+      list.appendChild(row);
+      scrollBottom();
+      return;
+    }
     list.appendChild(makeBubble('err', msg));
     scrollBottom();
   }

@@ -417,9 +417,14 @@ function memoryBlock(notes) {
   return lines.length ? lines.join('\n') : '（还什么都没记住，正常聊就行）'
 }
 
-function buildSystem(notes, recallText, backText, factsText) {
+function buildSystem(notes, recallText, backText, factsText, history) {
   const base = promptText().replace('{memory}', memoryBlock(notes))
   let out = base + `\n\n现在是 ${formatNow()}（北京时间）。这是系统提供的准确时间，可信。`
+  // 时间认知：以「醒」为一天的开始，而不是日历午夜
+  try {
+    const tb = timeBlock(history)
+    if (tb) out += `\n\n${tb}`
+  } catch {}
   // 状态层：常驻注入，不依赖检索命中。这是「别把做过的事当成还没做」的关键。
   try {
     const sb = stateBlock(loadState())
@@ -436,6 +441,47 @@ function pad(n) { return String(n).padStart(2, '0') }
 function formatNow() {
   const d = new Date()
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+// ---------- 时间认知：以「醒」为一天开始，而不是日历午夜 ----------
+// 需求（用户原话）：她最好能大概知道「这一天」做了什么，而且这一天要建立在
+// 用户自己的认知上，不是单纯日历。睡和醒是「开始一天」最重要的信号。
+
+// 从最近的历史里找「醒」的信号，判断现在是不是「醒来后的新一天」。
+const WAKE_PATTERNS = [/醒了/, /刚醒/, /睡醒/, /起床/, /起来了/, /早安/, /早上好/]
+const SLEEP_PATTERNS = [/睡了/, /睡觉/, /去睡/, /晚安/, /睡了觉/, /眯一会/]
+
+function findWakeSignal(history) {
+  // 从后往前找，最近的信号优先级最高
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i]
+    if (m.role !== 'user') continue
+    const c = String(m.content || '')
+    // 先看醒（醒来 = 新一天开始）
+    if (WAKE_PATTERNS.some((p) => p.test(c))) {
+      return { type: 'wake', ts: m.ts || Date.now(), content: c }
+    }
+  }
+  return null
+}
+
+// 生成注入系统提示的时间认知块
+function timeBlock(history) {
+  const now = Date.now()
+  const wake = history ? findWakeSignal(history) : null
+  const lines = []
+  if (wake && wake.ts) {
+    const h = Math.round((now - new Date(wake.ts).getTime()) / 3600000)
+    const hm = Math.round((now - new Date(wake.ts).getTime()) / 60000)
+    if (h >= 1) {
+      lines.push(`· 对方最近一次「醒过来」是 ${h} 小时前。在那之后到现在，对对方来说都算「同一天」，中间没睡过觉。`)
+    } else if (hm >= 1) {
+      lines.push(`· 对方最近一次「醒过来」是 ${hm} 分钟前。从那之后到现在都算「同一天」。`)
+    }
+  }
+  lines.push('· 判断「今天/昨天」时，以「对方睡醒」为界，不是日历午夜。')
+  lines.push('· 如果对方没明确说过睡醒，就别硬分「昨天/今天」，用「几小时前」「刚才」这种相对说法更稳。')
+  return lines.length ? '【时间怎么算】\n' + lines.join('\n') : ''
 }
 
 function formatTs(ts) {
@@ -1091,7 +1137,7 @@ async function chat(ctx, req, res) {
     const options = {
       provider,
       model,
-      system: buildSystem(memory, recallStr, backStr, factsStr),
+      system: buildSystem(memory, recallStr, backStr, factsStr, history),
       messages: [{ role: 'user', content: userContent }],
       temperature: cfg.temperature,
       maxTokens: cfg.maxTokens,
@@ -1116,7 +1162,8 @@ async function chat(ctx, req, res) {
     for (const b of splitter.flush()) emit(b)
     if (tail) sse(res, { type: 'bubble', text: tail })
   } catch (error) {
-    sse(res, { type: 'error', message: String((error && error.message) || error).slice(0, 300) })
+    const isQuota = !!(error && error.quota)
+    sse(res, { type: 'error', message: String((error && error.message) || error).slice(0, 300), quota: isQuota })
   } finally {
     sse(res, { type: 'done' })
     if (!res.writableEnded) res.end()

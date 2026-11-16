@@ -24,6 +24,20 @@ function mapModel(model) {
   return m || CHAT_MODEL
 }
 
+// 判断是否是「额度耗尽/余额不足」类错误（日卡到期、积分用完）。
+// 防御式识别：既看 HTTP 状态码，也看 body 里的关键词，兜住 relay 的各种返回。
+function isQuotaError(status, text) {
+  const s = Number(status || 0)
+  const body = String(text || '').toLowerCase()
+  if (s === 402 || s === 403 || s === 429) {
+    // 402/403/429 也可能是限流，需要结合 body 判断；但若无 body 信息，402 直接视为额度问题
+    if (s === 402) return true
+    if (/insufficient|balance|quota|credit|expired|exhausted|充值|余额|额度|积分|到期|用完|不足/i.test(body)) return true
+    return false
+  }
+  return /insufficient.*(balance|credit|quota)|balance.*(insufficient|not enough)|quota.*(exceed|limit|exhaust)|credit.*(exhaust|deplet|insufficient)|额度.*(用|不|耗尽)|余额.*(不足|用)|积分.*(用|不)|到期|expired|充值/i.test(body)
+}
+
 // ---------- 模拟 llm.stream ----------
 
 async function* relayStream(options) {
@@ -50,7 +64,10 @@ async function* relayStream(options) {
 
   if (!res.ok || !res.body) {
     const text = await res.text().catch(() => '')
-    throw new Error(`relay ${res.status}: ${text.slice(0, 300)}`)
+    const quotaHit = isQuotaError(res.status, text)
+    const err = new Error(`relay ${res.status}: ${text.slice(0, 300)}`)
+    if (quotaHit) err.quota = true
+    throw err
   }
 
   const reader = res.body.getReader()

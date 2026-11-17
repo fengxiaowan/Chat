@@ -293,10 +293,26 @@
     row.innerHTML = '<div class="bubble"><i></i><i></i><i></i></div>';
     list.appendChild(row);
     S.typing = row;
-    setStatus('正在输入…', true);
+    // 计时：让她「还在想」这件事有可见的进展，而不是一片死寂
+    S.typingAt = Date.now();
+    S.typingLabel = '正在输入…';
+    setStatus(S.typingLabel, true);
+    clearInterval(S.typingTick);
+    S.typingTick = setInterval(() => {
+      if (!S.typing) return;
+      const sec = Math.floor((Date.now() - S.typingAt) / 1000);
+      if (sec >= 4) setStatus((S.typingLabel || '正在输入…') + ' ' + sec + 's', true);
+    }, 1000);
     scrollBottom();
   }
+  // 只想换提示语、不想重开计时的时候用
+  function setTypingLabel(text) {
+    S.typingLabel = text;
+    if (S.typing) setStatus(text, true);
+  }
   function hideTyping() {
+    clearInterval(S.typingTick);
+    S.typingTick = null;
     if (S.typing) { S.typing.remove(); S.typing = null; }
     setStatus('', false);
   }
@@ -553,7 +569,8 @@
     let got = 0;
     let timedOut = false;
     let idleTimer = null;
-    const timeoutMs = isRetry ? 30000 : 15000;
+    // 服务端每 2 秒会发心跳，所以「静默 60 秒」基本只可能是连接真的断了。
+    const timeoutMs = 60000;
     const armIdle = () => {
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
@@ -591,7 +608,8 @@
             try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
             if (gen !== S.gen) return;
             if (evt.type === 'bubble') { got += 1; S.queue.push(evt.text); if (autoPlay) prefetchTts(evt.text); wake(); armIdle(); }
-            else if (evt.type === 'thinking') { armIdle(); }
+            else if (evt.type === 'thinking') { if (!S.typing) showTyping(); armIdle(); }
+            else if (evt.type === 'wait') { setTypingLabel(evt.text || '她那边有点挤，我排一下队…'); armIdle(); }
             else if (evt.type === 'error') { showError(evt.message, !!evt.quota); }
             else if (evt.type === 'info') {
               if (evt.limit) S.limit = evt.limit;
@@ -622,10 +640,12 @@
         wake();
         if (timedOut && got === 0) {
           if (!isRetry) {
-            addBubble('assistant', '诶，刚才卡了一下，我重接一下…');
-            setTimeout(() => { if (gen === S.gen) runTurn(text, true, images); }, 300);
+            // 连接确实断了才重连，而且先让状态栏自己说话，别让她莫名其妙来一句「诶」
+            setTypingLabel('连接断了，我重连一下…');
+            showTyping();
+            setTimeout(() => { if (gen === S.gen) runTurn(text, true, images); }, 800);
           } else {
-            addBubble('assistant', '还是没接上，你再说一遍？');
+            addBubble('assistant', '好像还是没接上，你等会儿再说一句？');
           }
         }
       }
@@ -664,6 +684,13 @@
       const row = makeBubble('err', '猫粮吃完啦，我这边断粮了 (´｡• ᵕ •｡) 去续一下再接着聊～');
       const el = row.querySelector('.bubble');
       if (el) el.classList.add('quota-bubble');
+      list.appendChild(row);
+      scrollBottom();
+      return;
+    }
+    if (/429|并发|拥挤|稍后重试|rate.?limit/i.test(String(msg)) && !isQuota) {
+      // 并发被占满：这不是坏了，就是排队，用她的口吻轻轻带过
+      const row = makeBubble('err', '刚才有点挤，没接上话。你再发一次就好～');
       list.appendChild(row);
       scrollBottom();
       return;

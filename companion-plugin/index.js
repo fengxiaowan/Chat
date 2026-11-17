@@ -146,11 +146,63 @@ const EPISODE_BATCH = 20        // 每累计约 10 轮(20 条)消息，批量压
 const EPISODE_WINDOW = 40       // 每段（每次 LLM 调用）压缩的消息条数
 const EPISODE_BACKFILL_MAX = 30 // 单次后台最多压多少段，防历史太长一次跑不完
 const MAX_EPISODES = 200        // 事件卡超过该数量时，把最旧一批并进滚动摘要
-const RECALL_K = 4             // 每轮主动回忆最多注入几条
+const RECALL_K = 5             // 每轮主动回忆最多注入几条
 const RECALL_THRESHOLD = 0.28  // 相关分低于此值就不注入，省 token
+// 新鲜度衰减：2 个月线性衰减，别让「昨天的一句错话」压过「上周的正确记忆」。
+const RECALL_DECAY_DAYS = 60
 const MAX_SUMMARY = 160        // 滚动摘要最长字符
 const HARD = new Set(Array.from('。！？!?\n'))
 const SOFT = new Set(Array.from('，,；;、：:'))
+// 成对引号：开、闭一一对应。切气泡时不能把一对引号从中间劈开。
+// 含全角弯引号、直角引号「」、半角引号。
+const QUOTE_PAIRS = [['“', '”'], ['‘', '’'], ['「', '」'], ['"', '"'], ["'", "'"]]
+
+// 判断从字符串开头到 pos 处，是否还有未闭合的开引号（即 pos 落在引号内部）。
+function insideQuote(s, pos) {
+  const head = s.slice(0, pos)
+  for (const [open, close] of QUOTE_PAIRS) {
+    if (open === close) {
+      // 半角引号开闭同形，成对出现；奇数个 = 未闭合
+      const n = (head.match(new RegExp(open.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length
+      if (n % 2 === 1) return true
+    } else {
+      let depth = 0
+      for (const ch of head) {
+        if (ch === open) depth++
+        else if (ch === close && depth > 0) depth--
+      }
+      if (depth > 0) return true
+    }
+  }
+  return false
+}
+
+// 给定一个切点，若它落在引号内部，则往前回退到那个未闭合引号之前，返回安全切点。
+// 若回退后太靠前（小于一半），就放弃回退、返回原切点（宁可硬切也不切出一堆碎渣）。
+function backOffQuote(s, cutAt, minLen) {
+  if (!insideQuote(s, cutAt)) return cutAt
+  // 从 cutAt 往前找最近的未闭合引号位置
+  for (let i = cutAt - 1; i >= 0; i--) {
+    const ch = s[i]
+    for (const [open, close] of QUOTE_PAIRS) {
+      if (ch === open) {
+        if (open === close) {
+          const n = (s.slice(0, i).match(new RegExp(open.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length
+          if (n % 2 === 0) return i  // 这个 open 是导致未闭合的那个
+        } else {
+          // 检查 i 处是否是这个 pair 里导致未闭合的 open
+          let depth = 0
+          for (let k = 0; k <= i; k++) {
+            if (s[k] === open) depth++
+            else if (s[k] === close && depth > 0) depth--
+          }
+          if (depth === 1 && i >= minLen) return i
+        }
+      }
+    }
+  }
+  return cutAt
+}
 
 // ---------- 落盘 ----------
 
@@ -317,9 +369,11 @@ function splitLong(s, limit = 52) {
       window.lastIndexOf('、'),
     )
     if (cut < limit / 2) cut = limit
+    // 切点若落在引号内部，回退到引号之前，别劈开引号对
+    cut = backOffQuote(rest, cut, Math.floor(limit / 2))
     const head = rest.slice(0, cut).replace(/[，,；;、 ]+$/, '')
     if (head) parts.push(head)
-    rest = rest.slice(cut + 1).replace(/^[，,；;、 ]+/, '')
+    rest = rest.slice(cut).replace(/^[，,；;、 ]+/, '')
   }
   if (rest.trim()) parts.push(rest.trim())
   return parts.length ? parts : [s]
@@ -350,7 +404,15 @@ class Splitter {
       }
       let emit = false
       let cutAt = this.buf.length
-      if (HARD.has(ch)) {
+      // 当前 buffer 末尾是否还处在一对未闭合引号之内
+      const inQuote = insideQuote(this.buf, this.buf.length)
+      if (inQuote) {
+        // 引号还没闭合：不因标点/换行断句，只做「硬上限兜底」，防止超长引号无限膨胀
+        if (this.buf.length >= this.hard) {
+          emit = true
+          cutAt = this.buf.length
+        }
+      } else if (HARD.has(ch)) {
         emit = true
       } else if (this.buf.length >= this.soft && SOFT.has(ch)) {
         emit = true
@@ -368,6 +430,8 @@ class Splitter {
         if (idx >= this.soft * 0.6) cutAt = idx + 1
       }
       if (emit) {
+        // 切点若落在成对引号内部，往前回退，别把引号劈成两半
+        cutAt = backOffQuote(this.buf, cutAt, Math.floor(this.soft * 0.6))
         const piece = this.buf.slice(0, cutAt)
         this.buf = this.buf.slice(cutAt)
         const b = cleanBubble(piece)
@@ -419,7 +483,7 @@ function memoryBlock(notes) {
 
 function buildSystem(notes, recallText, backText, factsText, history) {
   const base = promptText().replace('{memory}', memoryBlock(notes))
-  let out = base + `\n\n现在是 ${formatNow()}（北京时间）。这是系统提供的准确时间，可信。`
+  let out = base + `\n\n现在是 ${formatNow()}（北京时间）。这是系统提供的准确时间，可信。\n时间只是背景信息，不要根据时间（尤其深夜/凌晨）主动去问对方困不困、要不要睡、怎么还不睡。除非对方自己先提困或睡，你才顺着说。`
   // 时间认知：以「醒」为一天的开始，而不是日历午夜
   try {
     const tb = timeBlock(history)
@@ -451,36 +515,62 @@ function formatNow() {
 const WAKE_PATTERNS = [/醒了/, /刚醒/, /睡醒/, /起床/, /起来了/, /早安/, /早上好/]
 const SLEEP_PATTERNS = [/睡了/, /睡觉/, /去睡/, /晚安/, /睡了觉/, /眯一会/]
 
+// 从后往前找最近的「睡」或「醒」信号（谁更靠后，谁就是最新状态）。
+// 返回 { type: 'wake'|'sleep', ts, content }，没找到则 null。
 function findWakeSignal(history) {
-  // 从后往前找，最近的信号优先级最高
+  if (!Array.isArray(history)) return null
   for (let i = history.length - 1; i >= 0; i--) {
     const m = history[i]
-    if (m.role !== 'user') continue
+    if (!m || m.role !== 'user') continue
     const c = String(m.content || '')
-    // 先看醒（醒来 = 新一天开始）
     if (WAKE_PATTERNS.some((p) => p.test(c))) {
       return { type: 'wake', ts: m.ts || Date.now(), content: c }
+    }
+    if (SLEEP_PATTERNS.some((p) => p.test(c))) {
+      return { type: 'sleep', ts: m.ts || Date.now(), content: c }
     }
   }
   return null
 }
 
+// 判断对方「现在」是醒着还是睡着/可能睡了。
+// 规则：最近的信号是「醒」→ 醒着；最近的信号是「睡」→ 可能已经睡了。
+// 没有信号 → unknown，不硬猜。
+function sleepState(history) {
+  const sig = findWakeSignal(history)
+  if (!sig) return 'unknown'
+  return sig.type === 'wake' ? 'awake' : 'asleep'
+}
+
 // 生成注入系统提示的时间认知块
 function timeBlock(history) {
   const now = Date.now()
-  const wake = history ? findWakeSignal(history) : null
+  const sig = history ? findWakeSignal(history) : null
+  const state = sleepState(history)
   const lines = []
-  if (wake && wake.ts) {
-    const h = Math.round((now - new Date(wake.ts).getTime()) / 3600000)
-    const hm = Math.round((now - new Date(wake.ts).getTime()) / 60000)
-    if (h >= 1) {
-      lines.push(`· 对方最近一次「醒过来」是 ${h} 小时前。在那之后到现在，对对方来说都算「同一天」，中间没睡过觉。`)
-    } else if (hm >= 1) {
-      lines.push(`· 对方最近一次「醒过来」是 ${hm} 分钟前。从那之后到现在都算「同一天」。`)
+  if (sig && sig.ts) {
+    const h = Math.round((now - new Date(sig.ts).getTime()) / 3600000)
+    const hm = Math.round((now - new Date(sig.ts).getTime()) / 60000)
+    if (sig.type === 'wake') {
+      if (h >= 1) {
+        lines.push(`· 对方最近一次「醒过来」是 ${h} 小时前。在那之后到现在，对对方来说都算「同一天」，中间没睡过觉。`)
+      } else if (hm >= 1) {
+        lines.push(`· 对方最近一次「醒过来」是 ${hm} 分钟前。从那之后到现在都算「同一天」。`)
+      } else {
+        lines.push(`· 对方刚刚才醒。`)
+      }
+    } else {
+      // 最近的信号是「睡」：说明对方说过去睡/晚安了，之后没有醒的信号
+      if (h >= 1) {
+        lines.push(`· 对方 ${h} 小时前说过要睡/去睡了，之后没再说过醒。所以对方现在很可能已经睡了，别问 TA 困不困，也别说「怎么还不睡」。`)
+      } else if (hm >= 1) {
+        lines.push(`· 对方 ${hm} 分钟前刚说要去睡，现在可能刚躺下，别催。`)
+      }
     }
   }
   lines.push('· 判断「今天/昨天」时，以「对方睡醒」为界，不是日历午夜。')
   lines.push('· 如果对方没明确说过睡醒，就别硬分「昨天/今天」，用「几小时前」「刚才」这种相对说法更稳。')
+  lines.push('· 对方睡没睡，只以对方自己说的话为准，不要根据现在几点去猜。')
   return lines.length ? '【时间怎么算】\n' + lines.join('\n') : ''
 }
 
@@ -627,7 +717,8 @@ async function maybeGenerateEpisodes(ctx, threadId, messages) {
     while (messages.length - cur >= EPISODE_BATCH && chunks < EPISODE_BACKFILL_MAX) {
       const chunk = messages.slice(cur, cur + EPISODE_WINDOW)
       if (!chunk.length) break
-      const eps = await compressEpisodes(ctx, chunk)
+      const prevEps = loadMemory().episodes
+      const eps = await compressEpisodes(ctx, chunk, prevEps)
       cur += chunk.length
       const m2 = loadMemory()
       m2.cursor[key] = cur
@@ -712,19 +803,33 @@ async function sweepState(ctx, episodes, prev, summary) {
   return { done, pending }
 }
 
-async function compressEpisodes(ctx, messages) {
+async function compressEpisodes(ctx, messages, prevEps) {
   const { provider, model } = extractSelection(tune())
   const lines = messages.map((m) => {
     const role = m.role === 'user' ? '对方' : '你'
     const ts = formatTs(m.ts)
     return ts ? `[${ts}] ${role}：${m.content}` : `${role}：${m.content}`
   })
+  // 关键：把「已经有的历史事件卡」喂给压缩模型，让它写新卡前能对照旧记忆。
+  // 否则它只看当前这段对话原文，会把「用户早就解释过、但这段里没复述」的事
+  // 误写成「未明确说明 / 没说过」，从而制造出「她忘了」的假象。
+  let prevText = ''
+  const prev = Array.isArray(prevEps) ? prevEps : []
+  if (prev.length) {
+    const recent = prev.slice(-40)
+    prevText = '【已有的记忆卡，写新卡前先对照，别重复也别把它们写成「没说过/未说明」】\n' +
+      recent.map((e) => `· ${e.theme}：${e.content}`).join('\n')
+  }
+  const transcript = lines.join('\n')
+  const userMsg = prevText
+    ? `已有的记忆卡：\n${prevText}\n\n本段对话：\n${transcript}`
+    : `本段对话：\n${transcript}`
   let text = ''
   for await (const chunk of ctx.llm.stream({
     provider,
     model,
     system: episodesText(),
-    messages: [{ role: 'user', content: [{ type: 'text', text: lines.join('\n') }] }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: userMsg }] }],
     temperature: 0.3,
     maxTokens: 2000,
     reasoningEffort: 'low',
@@ -750,7 +855,7 @@ function recallEpisodes(query, mem) {
   const scored = []
   for (const e of eps) {
     const ageDays = e.ts ? Math.max(0, (Date.now() - new Date(e.ts).getTime()) / 86400000) : 365
-    const decay = Math.max(0, 1 - ageDays / 30)
+    const decay = Math.max(0, 1 - ageDays / RECALL_DECAY_DAYS)
     // 1) 关键词命中：强信号（解决「推箱子」→「沉星之序」这类无共同字的情况）
     let kwHit = 0
     for (const kw of e.keywords || []) {
@@ -771,6 +876,18 @@ function recallEpisodes(query, mem) {
   }
   scored.sort((a, b) => b.score - a.score)
   return scored.slice(0, RECALL_K).map((s) => s.e)
+}
+
+// 「否定记忆」卡：内容声称「没说过/不记得/未说明」的记忆，会教模型否定真实发生过的旧事。
+// 召回结果里若同时存在「正面记得」的卡，就把这类卡压到后面甚至剔除。
+const NEGATIVE_MEMORY_RE = /(未明确说明|没有明确说明|没说过|未曾说过|没提过|未曾提过|不记得|忘了|没听说过|未提及)/
+
+function dedupNegativeRecall(scored) {
+  if (scored.length <= 1) return scored
+  const positive = scored.filter((s) => s && !NEGATIVE_MEMORY_RE.test(s.content || '') && !NEGATIVE_MEMORY_RE.test(s.theme || ''))
+  const negative = scored.filter((s) => s && (NEGATIVE_MEMORY_RE.test(s.content || '') || NEGATIVE_MEMORY_RE.test(s.theme || '')))
+  // 有正面记忆可注入时，否定卡几乎没价值（只会把她「教」忘），直接丢掉
+  return positive.length ? positive : negative
 }
 
 function recallBlock(eps, summary) {
@@ -902,8 +1019,23 @@ function openSse(res) {
 }
 
 function sse(res, obj) {
-  if (res.writableEnded) return
-  res.write('data: ' + JSON.stringify(obj) + '\n\n')
+  if (res.writableEnded || res.destroyed) return
+  try {
+    res.write('data: ' + JSON.stringify(obj) + '\n\n')
+  } catch {}
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
+// 「额度用完」和「并发被占满」是两件事：
+// 前者要用户去续卡，后者等几秒就好，重试一下通常就能过。
+// relay 的并发上限是整张卡共享的（实测 3），聊天、记忆提取、标题都在抢这几个位子。
+function isBusyError(message) {
+  const s = String(message || '')
+  if (/余额|额度|积分|到期|用完|不足|insufficient|balance|exhaust|expired/i.test(s)) return false
+  return /429|并发|拥挤|稍后重试|rate.?limit|too many|busy/i.test(s)
 }
 
 // ---------- 路由 ----------
@@ -924,9 +1056,37 @@ function ttsRate() {
   } catch { return '+15%' }
 }
 
+// 把「会被 edge-tts 逐字读出来的颜文字符号」洗掉，只留正常文字。
+// 像 (｡･ω･｡) 里的 ω 会被读成"欧米伽"、▽≧☆♡・ 这些也会被读出来，很怪。
+// 策略：删掉含颜文字符号的括号及其尾巴，再删游离的孤立符号。
+// 正常中文括号（说明）（火锅）保留；emoji（😊😺）保留；英文/日文不误删。
+function stripKaomoji(text) {
+  let s = String(text || '')
+  const pairs = [['(', ')'], ['（', '）'], ['[', ']'], ['【', '】'], ['{', '}'], ['｛', '｝'], ['<', '>'], ['＜', '＞']]
+  const esc = (ch) => ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  // 颜文字符号 = 不是「文字/数字/空白/普通标点/emoji」的字符
+  const KAO = /[^\p{L}\p{N}\s，。！？：；、""''「」『』《》（）()\[\]【】{}·\p{Emoji}\uFE0F\u200D]/u
+  // 常见颜文字尾巴字符（括号后面跟着的挥手/音符等）
+  const TAIL = '[ノﾉヘ♪♫・∴∵وヾﾟﾞ￣]*'
+  for (const [open, close] of pairs) {
+    const re = new RegExp(esc(open) + '[^' + esc(close) + ']*?' + esc(close) + TAIL, 'g')
+    s = s.replace(re, (m) => {
+      const closeIdx = m.indexOf(close)
+      return KAO.test(m.slice(1, closeIdx)) ? '' : m
+    })
+  }
+  // 删游离的孤立符号（保留 emoji）
+  s = s.replace(/[^\p{L}\p{N}\s，。！？：；、""''「」『』《》（）()\[\]【】{}\p{Emoji}\uFE0F\u200D]/gu, '')
+  // 删被空白包围的孤立尾巴字符
+  s = s.replace(/(?:^|\s)[ノﾉヘ♪♫・∴∵وヾﾟﾞ￣]+(?=\s|$)/g, ' ')
+  s = s.replace(/[ ]{2,}/g, ' ').trim()
+  return s
+}
+
 async function synthTts(text) {
   const voice = ttsVoice()
   const rate = ttsRate()
+  text = stripKaomoji(text)
   const hash = createHash('sha256').update(voice + '\n' + rate + '\n' + text).digest('hex')
   const mp3 = new URL(hash + '.mp3', TTS_URL)
   if (existsSync(mp3)) return mp3
@@ -1107,7 +1267,7 @@ async function chat(ctx, req, res) {
   // 主动回忆 + 原文回溯
   const mem = loadMemory()
   const lastUser = [...full].reverse().find((m) => m.role === 'user')
-  const recall = lastUser ? recallEpisodes(lastUser.content, mem) : []
+  const recall = lastUser ? dedupNegativeRecall(recallEpisodes(lastUser.content, mem)) : []
   const recallStr = lastUser ? recallBlock(recall, mem.summary) : ''
   const hasQuestion = lastUser ? /[?？]/.test(lastUser.content) : false
   const backStr = lastUser && (recall.length === 0 || hasQuestion)
@@ -1131,40 +1291,78 @@ async function chat(ctx, req, res) {
     sse(res, { type: 'bubble', text: bubble })
   }
 
-  try {
-    const userContent = [{ type: 'text', text: buildTranscript(history) }]
-    for (const u of validImages) userContent.push({ type: 'image_url', image_url: { url: u } })
-    const options = {
-      provider,
-      model,
-      system: buildSystem(memory, recallStr, backStr, factsStr, history),
-      messages: [{ role: 'user', content: userContent }],
-      temperature: cfg.temperature,
-      maxTokens: cfg.maxTokens,
-      reasoningEffort: cfg.reasoningEffort,
-      signal: abort.signal,
+  // 心跳 + 死等保护
+  // 模型可能迟迟不吐第一个字（排队、思考、网络慢），这段时间前端是完全静默的。
+  // 所以由后端每 2 秒明确说一声「还在」，前端就不会把「慢」当成「卡死」。
+  // 反过来，若连一个 chunk 都迟迟不来，后端主动收摊并说清楚，别让前端无限干等。
+  const HEARTBEAT_MS = 2000
+  const STALL_MS = 90000
+  const MAX_BUSY_ATTEMPTS = 4
+  const BUSY_BASE_MS = 1500
+
+  let lastActivity = Date.now()
+  let stalled = false
+  const heartbeat = setInterval(() => {
+    if (res.writableEnded) return
+    if (count === 0 && Date.now() - lastActivity > STALL_MS) {
+      stalled = true
+      try { abort.abort() } catch {}
+      return
     }
-    let lastThink = 0
-    for await (const chunk of ctx.llm.stream(options)) {
-      if (isText(chunk)) {
-        for (const b of splitter.push(chunk.text)) emit(b)
-      } else if (chunk && chunk.type === 'reasoning-delta') {
-        // 心跳：真正在思考时，前端据此延长超时，别误判为卡死
-        const now = Date.now()
-        if (now - lastThink > 800) {
-          lastThink = now
-          sse(res, { type: 'thinking' })
+    sse(res, { type: 'thinking' })
+  }, HEARTBEAT_MS)
+
+  try {
+    let attempt = 0
+    for (;;) {
+      attempt += 1
+      try {
+        const userContent = [{ type: 'text', text: buildTranscript(history) }]
+        for (const u of validImages) userContent.push({ type: 'image_url', image_url: { url: u } })
+        const options = {
+          provider,
+          model,
+          system: buildSystem(memory, recallStr, backStr, factsStr, history),
+          messages: [{ role: 'user', content: userContent }],
+          temperature: cfg.temperature,
+          maxTokens: cfg.maxTokens,
+          reasoningEffort: cfg.reasoningEffort,
+          signal: abort.signal,
         }
-      } else if (chunk && chunk.type === 'finish' && chunk.reason && chunk.reason.kind === 'error') {
-        sse(res, { type: 'error', message: (chunk.reason.failure && chunk.reason.failure.message) || '模型出错了' })
+        for await (const chunk of ctx.llm.stream(options)) {
+          lastActivity = Date.now()
+          if (isText(chunk)) {
+            for (const b of splitter.push(chunk.text)) emit(b)
+          } else if (chunk && chunk.type === 'finish' && chunk.reason && chunk.reason.kind === 'error') {
+            sse(res, { type: 'error', message: (chunk.reason.failure && chunk.reason.failure.message) || '模型出错了' })
+          }
+        }
+        for (const b of splitter.flush()) emit(b)
+        if (tail) sse(res, { type: 'bubble', text: tail })
+        break
+      } catch (error) {
+        const msg = String((error && error.message) || error)
+        // 并发被占满：别把这口气撒给用户，原地排个队再试。
+        // 还没出过气泡时才重试，避免重复输出。
+        if (!stalled && count === 0 && attempt < MAX_BUSY_ATTEMPTS && isBusyError(msg)) {
+          const waitMs = BUSY_BASE_MS * attempt
+          sse(res, { type: 'wait', ms: waitMs, text: '她那边有点挤，我排一下队…' })
+          await sleep(waitMs)
+          lastActivity = Date.now()
+          continue
+        }
+        throw error
       }
     }
-    for (const b of splitter.flush()) emit(b)
-    if (tail) sse(res, { type: 'bubble', text: tail })
   } catch (error) {
     const isQuota = !!(error && error.quota)
-    sse(res, { type: 'error', message: String((error && error.message) || error).slice(0, 300), quota: isQuota })
+    if (stalled) {
+      sse(res, { type: 'error', message: '这次等太久没等到回复，你再说一句，我重新接。' })
+    } else {
+      sse(res, { type: 'error', message: String((error && error.message) || error).slice(0, 300), quota: isQuota })
+    }
   } finally {
+    clearInterval(heartbeat)
     sse(res, { type: 'done' })
     if (!res.writableEnded) res.end()
   }

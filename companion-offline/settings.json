@@ -1,6 +1,6 @@
 {
   "baseUrl": "https://tmai.ak03.cn/v1",
-  "apiKey": "sk-ar-4ec86efc576fd186ffdacfc8b1232003a8ad84ff0aa9a3f82ba18b1f0cb7fd1d",
+  "apiKey": "sk-ar-30a1133bf69cc9e200b81168f9070761f6dffd65c62cff53a3e49811e5203890",
   "chatModel": "deepseek-v4-pro",
   "extractModel": "deepseek-v4-flash"
 }

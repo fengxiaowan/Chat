@@ -212,3 +212,22 @@ footer {
 .episode-theme { font-weight: 600; color: #333; }
 .episode-content { color: #666; margin-top: 2px; line-height: 1.5; }
 .episode-mood { color: #aaa; font-size: 11px; margin-top: 3px; }
+
+/* 记录 / 事件卡 的编辑删除按钮 */
+.mini {
+  border: 1px solid #e0e0e0; background: #fff; color: #999;
+  font-size: 11px; line-height: 1; border-radius: 4px;
+  padding: 3px 6px; cursor: pointer; margin-left: 6px;
+}
+.mini:hover { color: #333; border-color: #bbb; }
+
+.mem-item { display: flex; align-items: center; }
+.mem-item .mem-text { flex: 1; }
+.mem-actions { display: inline-flex; align-items: center; }
+.mem-edit-input {
+  flex: 1; border: 1px solid #ccc; border-radius: 4px;
+  font-size: 13px; padding: 4px 6px; min-width: 0;
+}
+
+.episode-actions { margin-top: 6px; text-align: right; }
+.episode .mem-edit-input { display: block; width: 100%; box-sizing: border-box; margin-top: 4px; }

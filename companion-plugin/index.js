@@ -1015,6 +1015,8 @@ function openSse(res) {
     connection: 'keep-alive',
     'x-accel-buffering': 'no',
   })
+  // 关掉 Nagle：心跳/气泡都是小包，攒 40ms 再发在慢链路上会被放大成明显卡顿
+  try { if (res.socket && typeof res.socket.setNoDelay === 'function') res.socket.setNoDelay(true) } catch {}
   if (typeof res.flushHeaders === 'function') res.flushHeaders()
 }
 
@@ -1022,6 +1024,9 @@ function sse(res, obj) {
   if (res.writableEnded || res.destroyed) return
   try {
     res.write('data: ' + JSON.stringify(obj) + '\n\n')
+    // 手机走蜂窝/Tailscale 时，内核/TCP 缓冲可能把心跳攒起来再发，导致前端误判「静默」。
+    // 显式 flush 一次，让心跳和气泡尽快出网卡。
+    if (typeof res.flush === 'function') res.flush()
   } catch {}
 }
 
@@ -1182,7 +1187,7 @@ export function apply(ctx) {
   ensureDirs()
   const disposers = []
   disposers.push(ctx.webServer.register({ kind: 'prefix', path: BASE, resource: serveGet }))
-  for (const name of ['chat', 'notes', 'save', 'model']) {
+  for (const name of ['chat', 'notes', 'save', 'model', 'mem-edit', 'episode-edit']) {
     disposers.push(
       ctx.webServer.register({
         kind: 'exact',
@@ -1204,6 +1209,8 @@ async function handlePost(ctx, name, req, res) {
   if (name === 'notes') return notes(ctx, req, res)
   if (name === 'save') return save(ctx, req, res)
   if (name === 'model') return setModel(ctx, req, res)
+  if (name === 'mem-edit') return memEdit(ctx, req, res)
+  if (name === 'episode-edit') return episodeEdit(ctx, req, res)
 }
 
 // ---------- 切换模型 ----------
@@ -1222,6 +1229,95 @@ async function setModel(ctx, req, res) {
   try {
     writeTune({ model })
     return sendJson(res, 200, { ok: true, model })
+  } catch (error) {
+    return sendJson(res, 500, { error: String((error && error.message) || error).slice(0, 160) })
+  }
+}
+
+// ---------- 手动编辑 / 删除记忆（notes） ----------
+
+// body: { threadId, field, index, action: 'edit'|'delete', text }
+// field 是四类之一（about_you / how_to_talk / between_us / about_me），index 是该类里的第几条
+async function memEdit(ctx, req, res) {
+  let body
+  try {
+    body = await readJson(req)
+  } catch {
+    return sendJson(res, 400, { error: 'bad json' })
+  }
+  const threadId = safeId(body && body.threadId)
+  const field = String(body && body.field || '')
+  const action = String(body && body.action || '')
+  if (!threadId || !FIELDS.includes(field) || !['edit', 'delete'].includes(action)) {
+    return sendJson(res, 400, { error: 'bad params' })
+  }
+  const idx = Number(body && body.index)
+  if (!Number.isInteger(idx) || idx < 0) {
+    return sendJson(res, 400, { error: 'bad index' })
+  }
+  try {
+    const thread = readJsonUrl(threadUrl(threadId), null)
+    if (!thread || !Array.isArray(thread.messages)) {
+      return sendJson(res, 404, { error: 'thread not found' })
+    }
+    const notes = cleanNotes(thread.notes)
+    const list = notes[field] || []
+    if (idx >= list.length) {
+      return sendJson(res, 400, { error: 'index out of range' })
+    }
+    if (action === 'delete') {
+      list.splice(idx, 1)
+    } else {
+      const text = String(body && body.text || '').trim()
+      if (!text) return sendJson(res, 400, { error: 'empty text' })
+      list[idx] = text
+    }
+    notes[field] = list
+    thread.notes = notes
+    thread.updatedAt = new Date().toISOString()
+    writeJsonUrl(threadUrl(threadId), thread)
+    return sendJson(res, 200, { ok: true, notes })
+  } catch (error) {
+    return sendJson(res, 500, { error: String((error && error.message) || error).slice(0, 160) })
+  }
+}
+
+// ---------- 手动编辑 / 删除事件卡 ----------
+
+// body: { id, action: 'edit'|'delete', theme, content, mood, status }
+async function episodeEdit(ctx, req, res) {
+  let body
+  try {
+    body = await readJson(req)
+  } catch {
+    return sendJson(res, 400, { error: 'bad json' })
+  }
+  const id = String(body && body.id || '').trim()
+  const action = String(body && body.action || '')
+  if (!id || !['edit', 'delete'].includes(action)) {
+    return sendJson(res, 400, { error: 'bad params' })
+  }
+  try {
+    const mem = loadMemory()
+    const eps = mem.episodes || []
+    const i = eps.findIndex((e) => e && e.id === id)
+    if (i < 0) {
+      return sendJson(res, 404, { error: 'episode not found' })
+    }
+    if (action === 'delete') {
+      eps.splice(i, 1)
+    } else {
+      const e = eps[i]
+      if (body && body.theme != null) e.theme = String(body.theme).trim().slice(0, 24)
+      if (body && body.content != null) e.content = String(body.content).trim().slice(0, 60)
+      if (body && body.mood != null) e.mood = String(body.mood).trim().slice(0, 12)
+      if (body && body.status != null) {
+        e.status = ['done', 'plan', 'idea'].includes(String(body.status)) ? String(body.status) : e.status
+      }
+    }
+    mem.episodes = eps
+    writeMemory(mem)
+    return sendJson(res, 200, { ok: true, episodes: eps.slice().reverse() })
   } catch (error) {
     return sendJson(res, 500, { error: String((error && error.message) || error).slice(0, 160) })
   }

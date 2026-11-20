@@ -103,10 +103,16 @@
   // 目的：气泡还在「逐字打」的同时就把语音生成好，出声不用再等 1.2~1.6 秒。
   // 做法：拿到一句文本立刻发起请求，把 blob 存进 ttsPrefetch，播放时直接用。
   const ttsPrefetch = new Map();
-  function prefetchTts(text) {
-    const key = String(text || '').trim();
-    if (!key || ttsPrefetch.has(key)) return;
-    ttsPrefetch.set(key, null); // 占位，避免重复请求
+  // 串行预取队列：手机走蜂窝/Tailscale 时并发打满会互相拖累、也更容易断，
+  // 改成同一时刻最多一个在途请求，一条条稳稳拿。
+  let ttsPrefetchBusy = false;
+  const ttsPrefetchQueue = [];
+  function drainTtsPrefetch() {
+    if (ttsPrefetchBusy) return;
+    const job = ttsPrefetchQueue.shift();
+    if (!job) return;
+    ttsPrefetchBusy = true;
+    const { key } = job;
     try {
       const url = BASE + '/tts?text=' + encodeURIComponent(key);
       fetch(url, { credentials: 'same-origin' })
@@ -125,10 +131,21 @@
           } else {
             ttsPrefetch.delete(key);
           }
-          kickPump();
         })
-        .catch(() => { ttsPrefetch.delete(key); kickPump(); });
-    } catch { ttsPrefetch.delete(key); }
+        .catch(() => { ttsPrefetch.delete(key); })
+        .finally(() => {
+          ttsPrefetchBusy = false;
+          drainTtsPrefetch();
+          kickPump();
+        });
+    } catch { ttsPrefetch.delete(key); ttsPrefetchBusy = false; drainTtsPrefetch(); }
+  }
+  function prefetchTts(text) {
+    const key = String(text || '').trim();
+    if (!key || ttsPrefetch.has(key)) return;
+    ttsPrefetch.set(key, null); // 占位，避免重复请求
+    ttsPrefetchQueue.push({ key });
+    drainTtsPrefetch();
   }
 
   // 单例 audio：解锁一次，之后换 src 复用（新 Audio 每次都会被拦）
@@ -205,15 +222,15 @@
     a.src = BASE + '/tts?text=' + encodeURIComponent(key);
     a.play().catch(() => { finishPlay(); });
   }
-  // 等某句的预取结果（最多等 4 秒，超时就用普通请求）
+  // 等某句的预取结果（最多等 8 秒，超时就用普通请求）
   function waitPrefetch(key, cb) {
     const t0 = Date.now();
     const tick = () => {
       const v = ttsPrefetch.get(key);
       if (typeof v === 'string') return cb(v);
       if (!ttsPrefetch.has(key)) return cb(null);
-      if (Date.now() - t0 > 4000) return cb(null);
-      setTimeout(tick, 40);
+      if (Date.now() - t0 > 8000) return cb(null);
+      setTimeout(tick, 60);
     };
     tick();
   }
@@ -569,8 +586,9 @@
     let got = 0;
     let timedOut = false;
     let idleTimer = null;
-    // 服务端每 2 秒会发心跳，所以「静默 60 秒」基本只可能是连接真的断了。
-    const timeoutMs = 60000;
+    // 服务端每 2 秒会发心跳；但手机走蜂窝/Tailscale 时抖动大、心跳可能被缓冲推迟，
+    // 所以「静默」判定放宽到 90 秒（和后端 stall 一致），只要收到过任意字节就重置。
+    const timeoutMs = 90000;
     const armIdle = () => {
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
@@ -582,7 +600,8 @@
     armIdle();
 
     try {
-      const payload = { notes: S.notes, messages: S.history };
+      // 只发最近 S.limit 条（后端 historyTurns 也按这个数切），省上行带宽、更快拿到首字节
+      const payload = { notes: S.notes, messages: S.history.slice(-S.limit) };
       if (images && images.length) payload.images = images;
       const resp = await fetch(BASE + '/chat', {
         method: 'POST',
@@ -802,15 +821,95 @@
       h.textContent = label;
       wrap.appendChild(h);
       const ul = document.createElement('ul');
-      for (const it of items) {
+      items.forEach((it, idx) => {
         const li = document.createElement('li');
-        li.textContent = it;
+        li.className = 'mem-item';
+        const txt = document.createElement('span');
+        txt.className = 'mem-text';
+        txt.textContent = it;
+        const edit = document.createElement('button');
+        edit.type = 'button';
+        edit.className = 'mini';
+        edit.textContent = '改';
+        edit.title = '编辑';
+        edit.addEventListener('click', () => memInlineEdit(li, key, idx, it));
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'mini';
+        del.textContent = '删';
+        del.title = '删除';
+        del.addEventListener('click', () => memDelete(key, idx));
+        li.appendChild(txt);
+        li.appendChild(edit);
+        li.appendChild(del);
         ul.appendChild(li);
-      }
+      });
       wrap.appendChild(ul);
       box.appendChild(wrap);
     }
     if (!any) box.innerHTML = '<p class="mem-empty">还没记住什么，多聊几句就有了。</p>';
+  }
+
+  // 单条记忆就地编辑：把文字换成输入框 + 保存/取消
+  function memInlineEdit(li, field, idx, oldText) {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = oldText;
+    input.className = 'mem-edit-input';
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'mini';
+    save.textContent = '存';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'mini';
+    cancel.textContent = '取消';
+    const actions = document.createElement('span');
+    actions.className = 'mem-actions';
+    actions.appendChild(save);
+    actions.appendChild(cancel);
+    li.innerHTML = '';
+    li.appendChild(input);
+    li.appendChild(actions);
+    input.focus();
+    let done = false;
+    const finish = () => { if (!done) { done = true; renderMem(); } };
+    save.addEventListener('click', async () => {
+      const text = input.value.trim();
+      if (!text) { finish(); return; }
+      await memEdit(field, idx, 'edit', text);
+      finish();
+    });
+    cancel.addEventListener('click', finish);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') save.click();
+      if (e.key === 'Escape') finish();
+    });
+  }
+
+  async function memEdit(field, idx, action, text) {
+    try {
+      const r = await fetch(BASE + '/mem-edit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ threadId: S.threadId, field, index: idx, action, text }),
+      });
+      const d = await r.json();
+      if (r.ok && d.notes) {
+        S.notes = normalizeNotes(d.notes);
+        renderMem();
+        write(LS.notes, S.notes);
+      } else if (!r.ok) {
+        alert((d && d.error) || '操作失败');
+      }
+    } catch {
+      alert('操作失败');
+    }
+  }
+
+  async function memDelete(field, idx) {
+    if (!confirm('删掉这条记忆？')) return;
+    await memEdit(field, idx, 'delete');
   }
 
   // ---------- 输入框 ----------
@@ -921,11 +1020,101 @@
           m.textContent = e.mood;
           div.appendChild(m);
         }
+        const actions = document.createElement('div');
+        actions.className = 'episode-actions';
+        const edit = document.createElement('button');
+        edit.type = 'button';
+        edit.className = 'mini';
+        edit.textContent = '改';
+        edit.title = '编辑';
+        edit.addEventListener('click', () => episodeInlineEdit(div, e));
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'mini';
+        del.textContent = '删';
+        del.title = '删除';
+        del.addEventListener('click', () => episodeDelete(e));
+        actions.appendChild(edit);
+        actions.appendChild(del);
+        div.appendChild(actions);
         box.appendChild(div);
       }
     } catch {
       box.innerHTML = '<p class="mem-empty">读取失败。</p>';
     }
+  }
+
+  // 事件卡就地编辑：主题 + 内容 + 心情 三个输入框
+  function episodeInlineEdit(div, e) {
+    const themeIn = document.createElement('input');
+    themeIn.type = 'text';
+    themeIn.value = e.theme || '';
+    themeIn.className = 'mem-edit-input';
+    const contentIn = document.createElement('input');
+    contentIn.type = 'text';
+    contentIn.value = e.content || '';
+    contentIn.className = 'mem-edit-input';
+    const moodIn = document.createElement('input');
+    moodIn.type = 'text';
+    moodIn.value = e.mood || '';
+    moodIn.className = 'mem-edit-input';
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'mini';
+    save.textContent = '存';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'mini';
+    cancel.textContent = '取消';
+    const actions = document.createElement('div');
+    actions.className = 'episode-actions';
+    actions.appendChild(save);
+    actions.appendChild(cancel);
+    div.innerHTML = '';
+    div.appendChild(themeIn);
+    div.appendChild(contentIn);
+    div.appendChild(moodIn);
+    div.appendChild(actions);
+    themeIn.focus();
+    let done = false;
+    const finish = () => { if (!done) { done = true; renderEpisodes(); } };
+    save.addEventListener('click', async () => {
+      await episodeEdit(e.id, 'edit', {
+        theme: themeIn.value,
+        content: contentIn.value,
+        mood: moodIn.value,
+      });
+      finish();
+    });
+    cancel.addEventListener('click', finish);
+    [themeIn, contentIn, moodIn].forEach((el) => {
+      el.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') save.click();
+        if (ev.key === 'Escape') finish();
+      });
+    });
+  }
+
+  async function episodeEdit(id, action, fields) {
+    try {
+      const r = await fetch(BASE + '/episode-edit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, action, ...fields }),
+      });
+      const d = await r.json();
+      if (!r.ok) {
+        alert((d && d.error) || '操作失败');
+      }
+    } catch {
+      alert('操作失败');
+    }
+  }
+
+  async function episodeDelete(e) {
+    if (!confirm('删掉这张事件卡？')) return;
+    await episodeEdit(e.id, 'delete');
+    renderEpisodes();
   }
 
   // ---------- 设置 ----------
@@ -952,27 +1141,6 @@
       else stopAllTts();
     });
   }
-
-  // 模型切换
-  function syncModelUI() {
-    document.querySelectorAll('input[name="model"]').forEach((el) => {
-      el.checked = (el.value === S.model);
-    });
-  }
-  document.querySelectorAll('input[name="model"]').forEach((el) => {
-    el.addEventListener('change', async () => {
-      if (!el.checked) return;
-      const model = el.value;
-      try {
-        const r = await fetch(BASE + '/model', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model }),
-        });
-        if (r.ok) S.model = model;
-      } catch {}
-    });
-  });
 
   $('new').addEventListener('click', async () => {
     if (S.history.length && !confirm('开一段新的对话？现在这段会存进归档，随时能翻回来。')) return;
@@ -1103,7 +1271,6 @@
         const info = await (await fetch(BASE + '/info')).json();
         if (info && info.historyTurns) S.limit = info.historyTurns;
         if (info && info.model) S.model = info.model;
-        syncModelUI();
         updateUsage();
       } catch {}
     })();

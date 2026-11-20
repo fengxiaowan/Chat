@@ -1,0 +1,7 @@
+Test model: Alicia Solid (VRM 0.51)
+Author / copyright: © DWANGO Co., Ltd.
+Source file: https://github.com/vrm-c/UniVRM/tree/master/Tests/Models/Alicia_vrm-0.51
+Usage terms: https://3d.nicovideo.jp/alicia/rule.html
+VRM metadata: user=Everyone; commercial=Allow; sexual=Disallow; violent=Disallow
+Use: private local prototype testing. Review the linked terms before public redistribution or commercial use.
+SHA-256: 237bb02efadf8c13a114af91dd8e860173081457dee87017e51011c448d05dc2

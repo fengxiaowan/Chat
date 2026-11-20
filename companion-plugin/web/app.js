@@ -4,6 +4,26 @@
   const input = $('input');
   const sendBtn = $('send');
 
+  // 折叠 / 展开形象面板
+  const layout = $('companion-layout');
+  const collapseBtn = $('avatar-collapse');
+  const COLLAPSE_KEY = 'companion.avatarCollapsed.v1';
+  if (layout && collapseBtn) {
+    // 恢复上次的折叠状态
+    if (localStorage.getItem(COLLAPSE_KEY) === '1') layout.classList.add('collapsed');
+    const expandBtn0 = $('avatar-expand');
+    if (expandBtn0) expandBtn0.hidden = localStorage.getItem(COLLAPSE_KEY) !== '1';
+    collapseBtn.addEventListener('click', () => {
+      const collapsed = layout.classList.toggle('collapsed');
+      localStorage.setItem(COLLAPSE_KEY, collapsed ? '1' : '0');
+      collapseBtn.title = collapsed ? '展开形象' : '收起形象';
+      const expandBtn = $('avatar-expand');
+      if (expandBtn) expandBtn.hidden = !collapsed;
+    });
+    const expandBtn = $('avatar-expand');
+    if (expandBtn) expandBtn.addEventListener('click', () => collapseBtn.click());
+  }
+
   const BASE = '/liao';
   const LS = {
     hist: 'companion.history.v3',
@@ -92,6 +112,9 @@
     el.textContent = text;
     el.classList.toggle('typing', !!typing);
   }
+  function avatarState(state) {
+    window.dispatchEvent(new CustomEvent('companion-avatar', { detail: { state } }));
+  }
   let ttsAudio = null;
   let playingEl = null;
   let playEndCb = null;
@@ -164,6 +187,7 @@
   function finishPlay() {
     if (playingEl) playingEl.classList.remove('playing');
     playingEl = null;
+    avatarState('idle');
     const cb = playEndCb;
     playEndCb = null;
     if (cb) cb();
@@ -191,6 +215,7 @@
     if (playingEl) playingEl.classList.remove('playing');
     playingEl = null;
     playEndCb = null;
+    avatarState('idle');
   }
   function playOne(text, bubbleEl, onEnd) {
     const a = getAudio();
@@ -199,6 +224,7 @@
     playingEl = bubbleEl || null;
     if (playingEl) playingEl.classList.add('playing');
     playEndCb = onEnd || null;
+    avatarState('speaking');
     a.muted = false;
     const key = String(text || '').trim();
     const ready = ttsPrefetch.get(key);
@@ -300,6 +326,8 @@
     const row = makeBubble(role, text, img);
     list.appendChild(row);
     scrollBottom();
+    if (role === 'user') avatarState('listening');
+    if (role === 'assistant') avatarState('reply');
     return row.querySelector('.bubble');
   }
   function addDivider(text) {
@@ -319,6 +347,7 @@
     S.typingAt = Date.now();
     S.typingLabel = '正在输入…';
     setStatus(S.typingLabel, true);
+    avatarState('thinking');
     clearInterval(S.typingTick);
     S.typingTick = setInterval(() => {
       if (!S.typing) return;
@@ -337,6 +366,7 @@
     S.typingTick = null;
     if (S.typing) { S.typing.remove(); S.typing = null; }
     setStatus('', false);
+    if (!S.queue.length) avatarState('idle');
   }
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   function wake() { if (S.wake) { const r = S.wake; S.wake = null; r(); } }
@@ -1233,7 +1263,7 @@
     renderAll();
     renderMem();
     autosize();
-    try { const el = $('ver'); if (el) el.textContent = 'v20261116e'; } catch {}
+    try { const el = $('ver'); if (el) el.textContent = 'v20261120k'; } catch {}
 
     // 缓存里的东西先给用户用起来，剩下的在后台补
     let painted = S.history.length > 0;

@@ -1126,12 +1126,21 @@ const ASSETS = {
   [`${BASE}/app.js`]: ['app.js', 'application/javascript; charset=utf-8'],
   [`${BASE}/style.css`]: ['style.css', 'text/css; charset=utf-8'],
   [`${BASE}/sw.js`]: ['sw.js', 'application/javascript; charset=utf-8'],
+  [`${BASE}/avatar.js`]: ['avatar.js', 'application/javascript; charset=utf-8'],
+  [`${BASE}/vendor/three.module.js`]: ['vendor/three.module.js', 'application/javascript; charset=utf-8'],
+  [`${BASE}/vendor/three.core.js`]: ['vendor/three.core.js', 'application/javascript; charset=utf-8'],
+  [`${BASE}/vendor/three-vrm.module.js`]: ['vendor/three-vrm.module.js', 'application/javascript; charset=utf-8'],
+  [`${BASE}/vendor/GLTFLoader.js`]: ['vendor/GLTFLoader.js', 'application/javascript; charset=utf-8'],
+  [`${BASE}/vendor/utils/BufferGeometryUtils.js`]: ['vendor/utils/BufferGeometryUtils.js', 'application/javascript; charset=utf-8'],
+  [`${BASE}/assets/avatar/AliciaSolid.vrm`]: ['assets/avatar/AliciaSolid.vrm', 'model/gltf-binary'],
+  [`${BASE}/assets/avatar/Alicia-preview.png`]: ['assets/avatar/Alicia-preview.png', 'image/png'],
 }
 
 async function serveGet(request) {
-  if (!checkAuth(request.headers)) return UNAUTH_RES
   const url = new URL(request.url)
   const path = url.pathname.replace(/\/+$/, '') || BASE
+  const asset = ASSETS[path]
+  if (!checkAuth(request.headers) && !asset) return UNAUTH_RES
 
   if (path === BASE) {
     return new Response(read('index.html'), {
@@ -1143,12 +1152,17 @@ async function serveGet(request) {
       },
     })
   }
-  const asset = ASSETS[path]
   if (asset) {
-    return new Response(read(asset[0]), {
+    return new Response(readFileSync(new URL(asset[0], ROOT)), {
       headers: {
         'content-type': asset[1],
-        'cache-control': 'public, max-age=86400, stale-while-revalidate=604800',
+        'cache-control': path === `${BASE}/sw.js`
+          ? 'no-cache'
+          : path.endsWith('.vrm')
+            ? 'public, max-age=31536000, immutable'
+            : path.includes('/vendor/')
+              ? 'no-cache'
+              : 'public, max-age=86400, stale-while-revalidate=604800',
         ...(path === `${BASE}/sw.js` ? { 'service-worker-allowed': BASE } : {}),
       },
     })

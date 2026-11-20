@@ -113,9 +113,11 @@
     if (!job) return;
     ttsPrefetchBusy = true;
     const { key } = job;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 15000);
     try {
       const url = BASE + '/tts?text=' + encodeURIComponent(key);
-      fetch(url, { credentials: 'same-origin' })
+      fetch(url, { credentials: 'same-origin', signal: ctl.signal })
         .then((r) => (r.ok ? r.blob() : null))
         .then((blob) => {
           if (blob && blob.size > 0) {
@@ -134,11 +136,12 @@
         })
         .catch(() => { ttsPrefetch.delete(key); })
         .finally(() => {
+          clearTimeout(timer);
           ttsPrefetchBusy = false;
           drainTtsPrefetch();
           kickPump();
         });
-    } catch { ttsPrefetch.delete(key); ttsPrefetchBusy = false; drainTtsPrefetch(); }
+    } catch { clearTimeout(timer); ttsPrefetch.delete(key); ttsPrefetchBusy = false; drainTtsPrefetch(); }
   }
   function prefetchTts(text) {
     const key = String(text || '').trim();
@@ -269,6 +272,8 @@
       for (const im of list0) {
         const el = document.createElement('img');
         el.className = 'chat-img';
+        el.loading = 'lazy';
+        el.decoding = 'async';
         el.src = String(im).startsWith('data:') ? String(im) : BASE + '/img/' + im;
         el.addEventListener('load', keepBottom);
         el.addEventListener('error', keepBottom);
@@ -796,7 +801,13 @@
 
   // 浏览器自己报网络恢复时，立刻探一次（不用等退避）
   window.addEventListener('online', () => { if (netDown) { probeDelay = 0; runProbe(); } });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden && netDown) { probeDelay = 0; runProbe(); } });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    // Android 浏览器切回前台后可能暂停 audio，即使页面还活着；尝试继续
+    // 当前句子。预取请求自身带超时，完成/失败后会继续队列。
+    if (ttsAudio && playingEl && ttsAudio.paused) ttsAudio.play().catch(() => {});
+    if (netDown) { probeDelay = 0; runProbe(); }
+  });
 
   // ---------- 记忆展示 ----------
   const MEM_LABELS = [
@@ -1237,7 +1248,10 @@
     (async () => {
       let remote = null;
       try {
-        remote = await (await fetch(BASE + '/current?limit=300')).json();
+        const ctl = new AbortController();
+        const timer = setTimeout(() => ctl.abort(), 5000);
+        remote = await (await fetch(BASE + '/current?limit=300', { cache: 'no-store', signal: ctl.signal })).json();
+        clearTimeout(timer);
       } catch {
         // 首屏断网：先显示本地记录，并进入自动重连循环，网络一恢复就补齐
         if (!painted) setStatus('连不上，先看本地的', false);
@@ -1268,7 +1282,10 @@
       setStatus('', false);
       scheduleSave(200);
       try {
-        const info = await (await fetch(BASE + '/info')).json();
+        const ctl = new AbortController();
+        const timer = setTimeout(() => ctl.abort(), 4000);
+        const info = await (await fetch(BASE + '/info', { cache: 'no-store', signal: ctl.signal })).json();
+        clearTimeout(timer);
         if (info && info.historyTurns) S.limit = info.historyTurns;
         if (info && info.model) S.model = info.model;
         updateUsage();

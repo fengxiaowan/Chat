@@ -26,6 +26,9 @@ const EPISODES_URL = new URL('episodes.json', MEMORY_URL)
 const STATE_URL = new URL('state.json', MEMORY_URL)
 const IMAGES_URL = new URL('./images/', DATA_URL)
 const TTS_URL = new URL('./tts/', DATA_URL)
+// 同一句语音可能同时被预取和播放请求命中。把生成任务合并，避免
+// 蜂窝网络抖动时重复启动 edge-tts，重复任务会互相抢带宽并延迟出声。
+const TTS_INFLIGHT = new Map()
 const PYTHON = 'C:\\Users\\lyy44\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\python\\python.exe'
 const TTS_VOICE = 'zh-CN-XiaoxiaoNeural'
 
@@ -1095,23 +1098,34 @@ async function synthTts(text) {
   const hash = createHash('sha256').update(voice + '\n' + rate + '\n' + text).digest('hex')
   const mp3 = new URL(hash + '.mp3', TTS_URL)
   if (existsSync(mp3)) return mp3
-  try { mkdirSync(TTS_URL, { recursive: true }) } catch {}
-  const txt = new URL(hash + '.txt', TTS_URL)
-  writeFileSync(txt, text, 'utf8')
-  await new Promise((resolve, reject) => {
-    execFile(
-      PYTHON,
-      ['-m', 'edge_tts', '--voice', voice, '--rate', rate, '--file', fileURLToPath(txt), '--write-media', fileURLToPath(mp3)],
-      { timeout: 30000 },
-      (err) => (err ? reject(err) : resolve()),
-    )
-  })
-  return mp3
+  const old = TTS_INFLIGHT.get(hash)
+  if (old) return old
+  const job = (async () => {
+    try { mkdirSync(TTS_URL, { recursive: true }) } catch {}
+    const txt = new URL(hash + '.txt', TTS_URL)
+    writeFileSync(txt, text, 'utf8')
+    await new Promise((resolve, reject) => {
+      execFile(
+        PYTHON,
+        ['-m', 'edge_tts', '--voice', voice, '--rate', rate, '--file', fileURLToPath(txt), '--write-media', fileURLToPath(mp3)],
+        { timeout: 30000 },
+        (err) => (err ? reject(err) : resolve()),
+      )
+    })
+    return mp3
+  })()
+  TTS_INFLIGHT.set(hash, job)
+  try {
+    return await job
+  } finally {
+    if (TTS_INFLIGHT.get(hash) === job) TTS_INFLIGHT.delete(hash)
+  }
 }
 
 const ASSETS = {
   [`${BASE}/app.js`]: ['app.js', 'application/javascript; charset=utf-8'],
   [`${BASE}/style.css`]: ['style.css', 'text/css; charset=utf-8'],
+  [`${BASE}/sw.js`]: ['sw.js', 'application/javascript; charset=utf-8'],
 }
 
 async function serveGet(request) {
@@ -1123,7 +1137,8 @@ async function serveGet(request) {
     return new Response(read('index.html'), {
       headers: {
         'content-type': 'text/html; charset=utf-8',
-        'cache-control': 'no-store',
+        // 页面壳可以短暂复用；对话数据仍由 /current 单独取，不进缓存。
+        'cache-control': 'private, max-age=60, stale-while-revalidate=300',
         'set-cookie': `companion_auth=${authCookie()}; Max-Age=2592000; Path=/liao; SameSite=Lax`,
       },
     })
@@ -1131,7 +1146,11 @@ async function serveGet(request) {
   const asset = ASSETS[path]
   if (asset) {
     return new Response(read(asset[0]), {
-      headers: { 'content-type': asset[1], 'cache-control': 'no-store' },
+      headers: {
+        'content-type': asset[1],
+        'cache-control': 'public, max-age=86400, stale-while-revalidate=604800',
+        ...(path === `${BASE}/sw.js` ? { 'service-worker-allowed': BASE } : {}),
+      },
     })
   }
   if (path === `${BASE}/info`) {

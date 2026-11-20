@@ -15,6 +15,11 @@ const { execSync } = require('node:child_process')
 const LISTEN_PORT = Number(process.env.COMPANION_PROXY_PORT || 8899)
 const LISTEN_HOST = process.env.COMPANION_PROXY_HOST || '0.0.0.0'
 const PREFIX = '/liao'
+// The standalone companion service has a stable port.  Prefer it before
+// scanning DSH's dynamically allocated ports; otherwise a listener bound to
+// 0.0.0.0 is invisible to the old 127.0.0.1-only scan and every public request
+// waits for the full probe sweep.
+const FIXED_TARGET_PORT = Number(process.env.COMPANION_TARGET_PORT || 8788)
 
 let target = null
 let discovering = null
@@ -45,7 +50,7 @@ function listLocalPorts() {
       timeout: 6000,
     })
     for (const line of out.split(/\r?\n/)) {
-      const m = line.match(/TCP\s+127\.0\.0\.1:(\d+)\s+\S+\s+\S+/i)
+      const m = line.match(/TCP\s+(?:127\.0\.0\.1|0\.0\.0\.0|\[::\]|::):(\d+)\s+\S+\s+\S+/i)
       if (m && /listen/i.test(line)) ports.add(Number(m[1]))
     }
   } catch {}
@@ -106,6 +111,17 @@ async function findTarget() {
       if (await probe(env.port)) {
         target = env
         log('目标端口（来自环境变量）', env.port)
+        return target
+      }
+    }
+    // Check the standalone service explicitly.  It is the service exposed by
+    // companion-tunnel and is intentionally bound to 0.0.0.0 for LAN/Tailscale
+    // access, so it must not depend on DSH port discovery.
+    if (FIXED_TARGET_PORT > 0 && FIXED_TARGET_PORT !== LISTEN_PORT && !tried.includes(FIXED_TARGET_PORT)) {
+      tried.push(FIXED_TARGET_PORT)
+      if (await probe(FIXED_TARGET_PORT)) {
+        target = { host: '127.0.0.1', port: FIXED_TARGET_PORT }
+        log('目标端口（固定陪伴服务）', FIXED_TARGET_PORT)
         return target
       }
     }

@@ -1162,7 +1162,7 @@ async function serveGet(request) {
             ? 'public, max-age=31536000, immutable'
             : path.includes('/vendor/')
               ? 'no-cache'
-              : 'public, max-age=86400, stale-while-revalidate=604800',
+              : 'public, max-age=300, must-revalidate',
         ...(path === `${BASE}/sw.js` ? { 'service-worker-allowed': BASE } : {}),
       },
     })
@@ -1220,7 +1220,7 @@ export function apply(ctx) {
   ensureDirs()
   const disposers = []
   disposers.push(ctx.webServer.register({ kind: 'prefix', path: BASE, resource: serveGet }))
-  for (const name of ['chat', 'notes', 'save', 'model', 'mem-edit', 'episode-edit']) {
+  for (const name of ['chat', 'notes', 'save', 'model', 'mem-edit', 'episode-edit', 'game-move', 'game-over']) {
     disposers.push(
       ctx.webServer.register({
         kind: 'exact',
@@ -1239,6 +1239,8 @@ async function handlePost(ctx, name, req, res) {
     return
   }
   if (name === 'chat') return chat(ctx, req, res)
+  if (name === 'game-move') return gameMove(ctx, req, res)
+  if (name === 'game-over') return gameOver(ctx, req, res)
   if (name === 'notes') return notes(ctx, req, res)
   if (name === 'save') return save(ctx, req, res)
   if (name === 'model') return setModel(ctx, req, res)
@@ -1385,6 +1387,7 @@ async function chat(ctx, req, res) {
   }
   const cfg = tune()
   const memory = cleanNotes(body && body.notes)
+  const game = body && body.game ? body.game : null
   const full = normMessages(body && body.messages)
   const history = full.slice(-cfg.historyTurns)
   const imageList = Array.isArray(body && body.images)
@@ -1451,7 +1454,7 @@ async function chat(ctx, req, res) {
         const options = {
           provider,
           model,
-          system: buildSystem(memory, recallStr, backStr, factsStr, history),
+          system: buildSystem(memory, recallStr, backStr, factsStr, history) + (gameBlock(game) ? '\n\n' + gameBlock(game) : '\n\n【关于棋局】如果对方提到下棋、复盘或这局怎么下的，你现在手上没有具体棋局面，直接说记不清或不知道，绝不许自己编造棋盘或结果。'),
           messages: [{ role: 'user', content: userContent }],
           temperature: cfg.temperature,
           maxTokens: cfg.maxTokens,
@@ -1494,6 +1497,203 @@ async function chat(ctx, req, res) {
     clearInterval(heartbeat)
     sse(res, { type: 'done' })
     if (!res.writableEnded) res.end()
+  }
+}
+
+// ---------- 下棋：让小喵（语言模型）本人落子，而不是规则引擎 ----------
+// 设计要点：
+//  1. 决策来自小喵这个人格（复用聊天同一套 prompt + 记忆），而不是冷冰冰的 minimax。
+//  2. 输出严格约束成坐标，后端做合法性校验；模型抽风时用「第一个空位」兜底，保证棋局不卡死。
+//  3. 兜底只是防死机，平时都是她自己在想；返回里带 fallback 标记，前端可选展示。
+
+// board 是一维长度 9 的数组，值只能是 'user'（对方/用户）、'assistant'（小喵/我）或 ''（空）。
+// 坐标约定：x=行、y=列，左上角是 (0,0)，右下角是 (2,2)。
+function boardToText(board) {
+  const rows = []
+  for (let r = 0; r < 3; r++) {
+    const cells = []
+    for (let c = 0; c < 3; c++) {
+      const v = board[r * 3 + c]
+      cells.push(v === 'user' ? '对方' : v === 'assistant' ? '我' : '·')
+    }
+    rows.push(`第${r}行（列 0~2）：${cells.join(' ')}`)
+  }
+  return rows.join('\n')
+}
+
+// 找井字棋里的「关键格」：自己两连可直接赢，对方两连必须堵。
+// 返回 { index, kind }，kind 是 'win'（赢）或 'block'（堵），没有则 null。
+function criticalCell(board) {
+  const LINES = [
+    [0, 1, 2], [3, 4, 5], [6, 7, 8],
+    [0, 3, 6], [1, 4, 7], [2, 5, 8],
+    [0, 4, 8], [2, 4, 6],
+  ]
+  let block = null
+  for (const [a, b, c] of LINES) {
+    const cells = [board[a], board[b], board[c]]
+    const mine = cells.filter((x) => x === 'assistant').length
+    const theirs = cells.filter((x) => x === 'user').length
+    const emptyIdx = cells.indexOf('')
+    if (emptyIdx < 0) continue
+    if (mine === 2) return { index: [a, b, c][emptyIdx], kind: 'win' }
+    if (theirs === 2 && !block) block = { index: [a, b, c][emptyIdx], kind: 'block' }
+  }
+  return block
+}
+
+// 聊天时把当前棋局作为背景注入给小喵，让她边下边聊、知道棋盘发生了什么。
+function gameBlock(game) {
+  if (!game || game.kind !== 'tictactoe') return ''
+  const b = Array.isArray(game.board) ? game.board : []
+  if (b.length !== 9) return ''
+  const over = !!game.over
+  const winner = game.winner === 'user' ? '对方' : game.winner === 'assistant' ? '我' : game.winner === 'draw' ? '平局' : ''
+  if (over) {
+    return `【你们刚下完一局井字棋，已经结束】结果：${winner}。最终棋盘如下（「对方」=对方、「我」=你、「·」=空位）：\n${boardToText(b)}\n\n对方如果跟你复盘、问这局怎么下的，就照这个最终棋盘如实说；记不清哪一步先后就说记不清，绝不许自己编一套棋路或结果。`
+  }
+  const turn = game.turn === 'user' ? '对方' : '我'
+  return `【你们正在下井字棋】棋盘如下（「对方」=对方、「我」=你、「·」=空位）：\n${boardToText(b)}\n现在轮到：${turn}。聊的时候自然带上棋局就行，别生硬汇报棋盘、别念规则。`
+}
+
+async function gameMove(ctx, req, res) {
+  let body
+  try {
+    body = await readJson(req)
+  } catch {
+    return sendJson(res, 400, { error: 'bad json' })
+  }
+  const board = Array.isArray(body && body.board) ? body.board : []
+  if (board.length !== 9) return sendJson(res, 400, { error: 'bad board' })
+
+  const empty = []
+  for (let i = 0; i < 9; i++) {
+    const v = board[i]
+    if (v !== 'user' && v !== 'assistant') empty.push(i)
+  }
+  if (!empty.length) return sendJson(res, 200, { move: null, gameOver: true })
+
+  const cfg = tune()
+  const memory = cleanNotes(body && body.notes)
+  const history = normMessages(body && body.messages).slice(-cfg.historyTurns)
+  const { provider, model } = selection(ctx, cfg)
+
+  const image = typeof body.image === 'string' && body.image.startsWith('data:image/') ? body.image : ''
+  const critical = criticalCell(board)
+  const criticalHint = critical
+    ? critical.kind === 'win'
+      ? `\n\n【关键一步】你现在已经有两个棋子在一条线上，只差一格就能连成三子赢下这局。那格是第 ${Math.floor(critical.index / 3)} 行第 ${critical.index % 3} 列（坐标 x=${Math.floor(critical.index / 3)}, y=${critical.index % 3}）。请你下在这里，并用自己的话说一句「要赢了」之类的话。`
+      : `\n\n【关键一步】对方已经有两个棋子在一条线上，第三格还空着，你必须下在那个空位堵住，否则对方下一步就赢了。那格是第 ${Math.floor(critical.index / 3)} 行第 ${critical.index % 3} 列（坐标 x=${Math.floor(critical.index / 3)}, y=${critical.index % 3}）。请你下在这里，并用自己的话说一句在堵对方。`
+    : ''
+
+  const system = promptText().replace('{memory}', memoryBlock(memory)) +
+    `\n\n你现在正跟朋友下井字棋。棋盘是 3×3，行和列都从 0 到 2，左上角是 (0,0)、右下角是 (2,2)。你的棋子记作「我」，对方的记作「对方」。\n\n下面是当前棋盘（「·」是空位）：\n${boardToText(board)}\n\n【下棋要先想再下】\n· 如果对方已经有任意一条线上两连、且第三格还空着，你必须优先下在那个空格堵住对方。\n· 如果你自己已经两连、且第三格空着，优先下在那里赢下这局。\n· 以上两种情况都没有，就下得自然随意一点，不用追求每一步都最优，可以像朋友一样随手落子，偶尔让一让。\n\n【回复格式】只输出一个 JSON 对象，不要任何额外文字或代码块：\n{"say":"用你自己的口吻说一句正在想的话","x":行,"y":列}\n其中 say 是 8~20 个字的心里话，说说你这一步在想什么；x、y 是落子坐标。${criticalHint}`
+
+  const recent = history.slice(-12).map((m) => {
+    const role = m.role === 'user' ? '对方' : '你'
+    return `${role}：${m.content}`
+  }).join('\n')
+
+  const userContent = [{ type: 'text', text: `最近聊天：\n${recent}\n\n现在轮到你落子。` }]
+  if (image) userContent.push({ type: 'image_url', image_url: { url: image } })
+
+  const abort = new AbortController()
+  req.on('close', () => abort.abort())
+
+  const fallbackMove = (index) => ({
+    x: Math.floor(index / 3),
+    y: index % 3,
+    index,
+  })
+
+  try {
+    let text = ''
+    for await (const chunk of ctx.llm.stream({
+      provider,
+      model,
+      system,
+      messages: [{ role: 'user', content: userContent }],
+      temperature: 0.3,
+      maxTokens: 160,
+      reasoningEffort: 'low',
+      signal: abort.signal,
+    })) {
+      if (isText(chunk)) text += chunk.text
+    }
+    let move = null
+    let say = ''
+    try {
+      const obj = parseJson(text)
+      const x = Number(obj.x)
+      const y = Number(obj.y)
+      if (Number.isInteger(x) && Number.isInteger(y) && x >= 0 && x <= 2 && y >= 0 && y <= 2) {
+        const i = x * 3 + y
+        if (empty.includes(i)) move = fallbackMove(i)
+      }
+      if (typeof obj.say === 'string') say = obj.say.trim().slice(0, 60)
+    } catch {}
+    if (!move) {
+      move = fallbackMove(empty[0])
+    }
+    return sendJson(res, 200, { move, say, fallback: false })
+  } catch {
+    return sendJson(res, 200, { move: fallbackMove(empty[0]), fallback: true })
+  }
+}
+
+// 游戏出结果时，让小喵知道结果并用自己的口吻说一句收尾话。
+// winner：'user'（对方/用户赢）、'assistant'（我赢）、'draw'（平局）。
+async function gameOver(ctx, req, res) {
+  let body
+  try {
+    body = await readJson(req)
+  } catch {
+    return sendJson(res, 400, { error: 'bad json' })
+  }
+  const board = Array.isArray(body && body.board) ? body.board : []
+  if (board.length !== 9) return sendJson(res, 400, { error: 'bad board' })
+  const winner = ['user', 'assistant', 'draw'].includes(body && body.winner) ? body.winner : 'draw'
+
+  const cfg = tune()
+  const memory = cleanNotes(body && body.notes)
+  const history = normMessages(body && body.messages).slice(-cfg.historyTurns)
+  const { provider, model } = selection(ctx, cfg)
+
+  const resultText = winner === 'user'
+    ? '对方赢了，你输了'
+    : winner === 'assistant'
+      ? '你赢了，对方输了'
+      : '平局'
+
+  const system = promptText().replace('{memory}', memoryBlock(memory)) +
+    `\n\n你们刚下完一局井字棋。结果是：${resultText}。\n最终棋盘（「对方」=对方、「我」=你、「·」=空位）：\n${boardToText(board)}\n\n现在你用你自己的口吻说一句收尾的话，自然一点，别念规则、别报结果、别总结。可以带点真实反应（赢了别太得意、输了别嘴硬、平局别硬夸）。只输出这一句话，不要引号、不要任何前缀。`
+
+  const recent = history.slice(-12).map((m) => {
+    const role = m.role === 'user' ? '对方' : '你'
+    return `${role}：${m.content}`
+  }).join('\n')
+
+  const abort = new AbortController()
+  req.on('close', () => abort.abort())
+
+  try {
+    let text = ''
+    for await (const chunk of ctx.llm.stream({
+      provider,
+      model,
+      system,
+      messages: [{ role: 'user', content: [{ type: 'text', text: `最近聊天：\n${recent}\n\n请说一句收尾的话。` }] }],
+      temperature: 0.8,
+      maxTokens: 80,
+      reasoningEffort: 'low',
+      signal: abort.signal,
+    })) {
+      if (isText(chunk)) text += chunk.text
+    }
+    const say = text.replace(/["'「」]/g, '').trim().slice(0, 80)
+    return sendJson(res, 200, { say })
+  } catch {
+    return sendJson(res, 200, { say: '' })
   }
 }
 

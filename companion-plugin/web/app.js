@@ -4,7 +4,7 @@
   const input = $('input');
   const sendBtn = $('send');
 
-  // 折叠 / 展开形象面板
+  // 折叠 / 展开侧栏（形象 + 下棋）
   const layout = $('companion-layout');
   const collapseBtn = $('avatar-collapse');
   const COLLAPSE_KEY = 'companion.avatarCollapsed.v1';
@@ -16,7 +16,7 @@
     collapseBtn.addEventListener('click', () => {
       const collapsed = layout.classList.toggle('collapsed');
       localStorage.setItem(COLLAPSE_KEY, collapsed ? '1' : '0');
-      collapseBtn.title = collapsed ? '展开形象' : '收起形象';
+      collapseBtn.title = collapsed ? '展开侧栏' : '收起侧栏';
       const expandBtn = $('avatar-expand');
       if (expandBtn) expandBtn.hidden = !collapsed;
     });
@@ -115,6 +115,237 @@
   function avatarState(state) {
     window.dispatchEvent(new CustomEvent('companion-avatar', { detail: { state } }));
   }
+
+  // ---------- 下棋：小喵（语言模型）陪下井字棋 ----------
+  // 棋盘是纯前端渲染，落子决策来自后端 game-move（小喵本人），不是本地规则引擎。
+  // 3D 形象已断开，不再参与；以后想恢复形象，见 git 历史里的 avatar.js。
+  const GAME_KEY = 'companion.game.tictactoe.v1';
+  const EMPTY_BOARD = () => Array(9).fill('');
+  const WIN_LINES = [
+    [0, 1, 2], [3, 4, 5], [6, 7, 8],
+    [0, 3, 6], [1, 4, 7], [2, 5, 8],
+    [0, 4, 8], [2, 4, 6],
+  ];
+  const G = {
+    board: EMPTY_BOARD(),
+    turn: 'user',       // 用户先手
+    over: false,
+    winner: '',         // 'user' | 'assistant' | 'draw'
+    busy: false,
+  };
+  const boardEl = $('board');
+  const gameStatusEl = $('game-status');
+
+  function loadGame() {
+    const g = read(GAME_KEY, null);
+    if (g && Array.isArray(g.board) && g.board.length === 9) {
+      G.board = g.board.slice();
+      G.turn = g.turn === 'assistant' ? 'assistant' : 'user';
+      G.over = !!g.over;
+      G.winner = ['user', 'assistant', 'draw'].includes(g.winner) ? g.winner : '';
+    }
+  }
+  function saveGame() {
+    write(GAME_KEY, { board: G.board, turn: G.turn, over: G.over, winner: G.winner });
+  }
+  function checkWinner(board) {
+    for (const line of WIN_LINES) {
+      const [a, b, c] = line;
+      if (board[a] && board[a] === board[b] && board[b] === board[c]) {
+        return { winner: board[a], line };
+      }
+    }
+    return board.every((v) => v) ? { winner: 'draw', line: null } : { winner: '', line: null };
+  }
+  // 把棋盘画成一张图，发给后端让「她」真的看见棋盘
+  function drawBoardImage() {
+    const SZ = 300;
+    const cv = document.createElement('canvas');
+    cv.width = SZ;
+    cv.height = SZ;
+    const ctx = cv.getContext('2d');
+    const cell = SZ / 3;
+    ctx.fillStyle = '#fdfaf7';
+    ctx.fillRect(0, 0, SZ, SZ);
+    // 网格线
+    ctx.strokeStyle = '#c9b8b0';
+    ctx.lineWidth = 4;
+    ctx.lineCap = 'round';
+    for (let k = 1; k < 3; k++) {
+      const p = cell * k;
+      ctx.beginPath(); ctx.moveTo(p, 0); ctx.lineTo(p, SZ); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, p); ctx.lineTo(SZ, p); ctx.stroke();
+    }
+    // 棋子：对方 X，自己 O
+    for (let i = 0; i < 9; i++) {
+      const v = G.board[i];
+      if (!v) continue;
+      const r = Math.floor(i / 3);
+      const c = i % 3;
+      const cx = c * cell + cell / 2;
+      const cy = r * cell + cell / 2;
+      ctx.lineWidth = 12;
+      if (v === 'user') {
+        ctx.strokeStyle = '#6f9ed9';
+        const off = cell * 0.24;
+        ctx.beginPath();
+        ctx.moveTo(cx - off, cy - off); ctx.lineTo(cx + off, cy + off);
+        ctx.moveTo(cx + off, cy - off); ctx.lineTo(cx - off, cy + off);
+        ctx.stroke();
+      } else {
+        ctx.strokeStyle = '#d98b8b';
+        ctx.beginPath();
+        ctx.arc(cx, cy, cell * 0.27, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+    return cv.toDataURL('image/png');
+  }
+  function renderBoard() {
+    if (!boardEl) return;
+    boardEl.innerHTML = '';
+    const winLine = G.winner && G.winner !== 'draw' ? WIN_LINES.find((l) => {
+      const [a, b, c] = l;
+      return G.board[a] && G.board[a] === G.board[b] && G.board[b] === G.board[c];
+    }) : null;
+    for (let i = 0; i < 9; i++) {
+      const cell = document.createElement('div');
+      cell.className = 'cell';
+      cell.setAttribute('role', 'gridcell');
+      const v = G.board[i];
+      if (v === 'user') { cell.textContent = '✕'; cell.classList.add('occupied', 'you'); }
+      else if (v === 'assistant') { cell.textContent = '◯'; cell.classList.add('occupied', 'me'); }
+      if (winLine && winLine.includes(i)) cell.classList.add('win');
+      cell.addEventListener('click', () => userMove(i));
+      boardEl.appendChild(cell);
+    }
+    if (G.over) {
+      if (G.winner === 'user') gameStatusEl.textContent = '你赢啦';
+      else if (G.winner === 'assistant') gameStatusEl.textContent = '小喵赢啦';
+      else if (G.winner === 'draw') gameStatusEl.textContent = '平局';
+      else gameStatusEl.textContent = '轮到你';
+    } else {
+      gameStatusEl.textContent = G.turn === 'user' ? '轮到你' : '小喵在想…';
+    }
+  }
+  function currentGame() {
+    return { kind: 'tictactoe', board: G.board, turn: G.turn, over: G.over, winner: G.winner };
+  }
+  function resetGame() {
+    G.board = EMPTY_BOARD();
+    G.turn = 'user';
+    G.over = false;
+    G.winner = '';
+    G.busy = false;
+    saveGame();
+    renderBoard();
+  }
+  // 让她先手：重置棋盘并立即由她走第一步
+  async function aiFirst() {
+    if (G.busy) return;
+    G.board = EMPTY_BOARD();
+    G.turn = 'assistant';
+    G.over = false;
+    G.winner = '';
+    G.busy = false;
+    saveGame();
+    renderBoard();
+    await assistantMove();
+  }
+  async function userMove(i) {
+    if (G.over || G.busy || G.turn !== 'user' || G.board[i]) return;
+    G.board[i] = 'user';
+    G.turn = 'assistant';
+    applyResult();
+    saveGame();
+    renderBoard();
+    if (G.over) { announceResult(); return; }
+    await assistantMove();
+  }
+  function applyResult() {
+    const r = checkWinner(G.board);
+    G.winner = r.winner;
+    G.over = !!r.winner;
+    if (G.over) G.turn = '';
+  }
+  // 游戏出结果时，让小喵知道结果并说一句收尾话
+  async function announceResult() {
+    if (!G.over) return;
+    try {
+      const r = await fetch(BASE + '/game-over', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          board: G.board,
+          winner: G.winner,
+          notes: S.notes,
+          messages: S.history.slice(-S.limit),
+        }),
+      });
+      if (!r.ok) return;
+      const d = await r.json();
+      if (d && d.say) {
+        addBubble('assistant', d.say);
+        S.history.push({ role: 'assistant', content: d.say, ts: Date.now() });
+        scheduleSave(200);
+      }
+    } catch {}
+  }
+  async function assistantMove() {
+    G.busy = true;
+    renderBoard();
+    try {
+      const image = drawBoardImage();
+      const r = await fetch(BASE + '/game-move', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          board: G.board,
+          image,
+          notes: S.notes,
+          messages: S.history.slice(-S.limit),
+        }),
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      if (d && d.move && d.move.index != null && !G.board[d.move.index]) {
+        G.board[d.move.index] = 'assistant';
+        G.turn = 'user';
+        applyResult();
+        saveGame();
+        // 她的心声：像平时说话一样变成一条小气泡
+        if (d.say) {
+          addBubble('assistant', d.say);
+          S.history.push({ role: 'assistant', content: d.say, ts: Date.now() });
+          scheduleSave(200);
+        }
+      }
+      if (G.over) announceResult();
+    } catch {
+      // 落子失败不打断聊天；给用户一个能继续的局面
+      G.turn = 'user';
+    } finally {
+      G.busy = false;
+      renderBoard();
+    }
+  }
+  // 模式切换：下棋 / 形象（形象当前是隐藏壳，加载代码已断开）
+  document.querySelectorAll('.mode-tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      const mode = tab.dataset.mode;
+      document.querySelectorAll('.mode-tab').forEach((t) => t.classList.toggle('active', t === tab));
+      const avatarShell = $('avatar-shell');
+      const gameShell = $('game-shell');
+      if (avatarShell) avatarShell.hidden = mode !== 'avatar';
+      if (gameShell) gameShell.hidden = mode !== 'game';
+      localStorage.setItem('companion.panelMode.v1', mode);
+    });
+  });
+  const savedMode = localStorage.getItem('companion.panelMode.v1') || 'game';
+  document.querySelectorAll('.mode-tab').forEach((t) => {
+    if (t.dataset.mode === savedMode) t.click();
+  });
+
   let ttsAudio = null;
   let playingEl = null;
   let playEndCb = null;
@@ -637,6 +868,8 @@
     try {
       // 只发最近 S.limit 条（后端 historyTurns 也按这个数切），省上行带宽、更快拿到首字节
       const payload = { notes: S.notes, messages: S.history.slice(-S.limit) };
+      // 无论棋局是否结束，都带上当前棋局面，让她能如实回顾，而不是凭印象瞎编
+      payload.game = currentGame();
       if (images && images.length) payload.images = images;
       const resp = await fetch(BASE + '/chat', {
         method: 'POST',
@@ -1252,6 +1485,14 @@
 
   // ---------- 启动 ----------
   (function boot() {
+    // 下棋：恢复本地棋局并渲染，绑定新一局按钮
+    loadGame();
+    renderBoard();
+    const gameNewBtn = $('game-new');
+    if (gameNewBtn) gameNewBtn.addEventListener('click', resetGame);
+    const gameAiFirstBtn = $('game-ai-first');
+    if (gameAiFirstBtn) gameAiFirstBtn.addEventListener('click', aiFirst);
+
     // 先用本地缓存立刻上屏，绝不等网络。手机上走 Tailscale 拉一次要好几百毫秒到几秒，
     // 干等着就是那个「空白聊天窗口」。
     const localHist = read(LS.hist, []);

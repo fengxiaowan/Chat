@@ -4,19 +4,38 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>闲聊</title>
-<link rel="stylesheet" href="/liao/style.css?v=20261121k">
+<link rel="stylesheet" href="/liao/style.css?v=20261121chess">
 </head>
 <body>
 <div class="companion-layout" id="companion-layout">
-  <section id="avatar-shell" class="avatar-shell" aria-label="虚拟形象">
-    <button id="avatar-collapse" class="avatar-collapse" title="收起形象" aria-label="收起形象">▸</button>
-    <img id="avatar-poster" class="avatar-poster" src="/liao/assets/avatar/Alicia-preview.png?v=20261121k" alt="Alicia 虚拟形象预览">
-    <canvas id="avatar-canvas"></canvas>
-    <div class="avatar-badge">
-      <span>Alicia</span>
-      <span id="avatar-status">在这里</span>
-    </div>
-  </section>
+  <aside class="side" id="side">
+    <nav class="mode-tabs">
+      <button class="mode-tab active" data-mode="game" title="下棋">♟ 下棋</button>
+      <button class="mode-tab" data-mode="avatar" title="形象">ฅ 形象</button>
+      <button id="avatar-collapse" class="avatar-collapse" title="收起侧栏" aria-label="收起侧栏">▸</button>
+    </nav>
+
+    <section id="avatar-shell" class="avatar-shell" aria-label="虚拟形象" hidden>
+<img id="avatar-poster" class="avatar-poster" src="/liao/assets/avatar/Alicia-preview.png?v=20261121chess" alt="Alicia 虚拟形象预览">
+      <canvas id="avatar-canvas"></canvas>
+      <div class="avatar-badge">
+        <span>Alicia</span>
+        <span id="avatar-status">在这里</span>
+      </div>
+    </section>
+
+    <section id="game-shell" class="game-shell" aria-label="下棋">
+      <div class="game-head">
+        <span class="game-title">井字棋</span>
+        <span id="game-status" class="game-status">轮到你</span>
+      </div>
+      <div class="board" id="board" role="grid" aria-label="井字棋盘"></div>
+      <div class="game-actions">
+        <button id="game-new" class="game-btn" title="新一局">新一局</button>
+        <button id="game-ai-first" class="game-btn" title="让她先手">让她先手</button>
+      </div>
+    </section>
+  </aside>
 
   <div class="phone">
     <header>
@@ -26,7 +45,7 @@
           <span id="status" class="status"></span>
         </div>
         <div class="actions">
-          <button id="avatar-expand" class="gear" title="展开形象" hidden>ฅ</button>
+          <button id="avatar-expand" class="gear" title="展开侧栏" hidden>ฅ</button>
           <button id="new" class="gear" title="新对话">＋</button>
           <button id="gear" class="gear" title="设置">⚙</button>
         </div>
@@ -93,8 +112,7 @@
   </div>
 </aside>
 
-<script src="/liao/app.js?v=20261121k"></script>
-<script type="module" src="/liao/avatar.js?v=20261121k"></script>
+<script src="/liao/app.js?v=20261121chess"></script>
 <script>
   // 华为浏览器切回时可能回收页面进程；缓存页面壳，恢复后先把本地对话画出来。
   if ('serviceWorker' in navigator) {

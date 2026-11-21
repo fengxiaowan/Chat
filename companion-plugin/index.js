@@ -1542,8 +1542,131 @@ function criticalCell(board) {
   return block
 }
 
+// ---------- 五子棋 ----------
+// 在 idx 落 player 后，是否在横/竖/两条对角线上连成至少 5 子。
+function gomokuWinsAt(board, size, idx, player) {
+  const row = Math.floor(idx / size)
+  const col = idx % size
+  const dirs = [[0, 1], [1, 0], [1, 1], [1, -1]]
+  for (const [dr, dc] of dirs) {
+    let count = 1
+    for (let step = -1; step <= 1; step += 2) {
+      let r = row + dr * step
+      let c = col + dc * step
+      while (r >= 0 && r < size && c >= 0 && c < size && board[r * size + c] === player) {
+        count++
+        r += dr * step
+        c += dc * step
+      }
+    }
+    if (count >= 5) return true
+  }
+  return false
+}
+
+// 返回 player 落子后能直接连成五的所有空位 index（赢点）。
+function gomokuWinMoves(board, size, player) {
+  const out = []
+  for (let i = 0; i < size * size; i++) {
+    if (board[i] !== '') continue
+    if (gomokuWinsAt(board, size, i, player)) out.push(i)
+  }
+  return out
+}
+
+// 单条线的价值：count=连子数，openEnds=两端开放空位数。
+function gomokuLineScore(count, openEnds) {
+  if (count >= 5) return 1000000
+  if (count === 4) return openEnds >= 2 ? 100000 : (openEnds === 1 ? 10000 : 0)
+  if (count === 3) return openEnds >= 2 ? 10000 : (openEnds === 1 ? 1000 : 0)
+  if (count === 2) return openEnds >= 2 ? 1000 : (openEnds === 1 ? 100 : 0)
+  if (count === 1) return openEnds >= 2 ? 100 : (openEnds === 1 ? 10 : 0)
+  return 0
+}
+
+// 在 (row,col) 放 player 后，评估该点四个方向的攻防价值。
+function gomokuPointScore(board, size, row, col, player) {
+  const dirs = [[0, 1], [1, 0], [1, 1], [1, -1]]
+  let total = 0
+  for (const [dr, dc] of dirs) {
+    let count = 1
+    let openEnds = 0
+    for (const sign of [1, -1]) {
+      let r = row + dr * sign
+      let c = col + dc * sign
+      while (r >= 0 && r < size && c >= 0 && c < size && board[r * size + c] === player) {
+        count++
+        r += dr * sign
+        c += dc * sign
+      }
+      if (r >= 0 && r < size && c >= 0 && c < size && board[r * size + c] === '') openEnds++
+    }
+    total += gomokuLineScore(count, openEnds)
+  }
+  return total
+}
+
+// 规则引擎选点：保证「分得清黑白、该堵会堵、该赢会赢」。
+// 没有强威胁时保留一点随性（在分数接近的候选里随机），符合小喵人设，而不是不败电脑。
+function gomokuBestMove(board, size) {
+  let best = []
+  let bestScore = -1
+  for (let i = 0; i < size * size; i++) {
+    if (board[i] !== '') continue
+    const row = Math.floor(i / size)
+    const col = i % size
+    const attack = gomokuPointScore(board, size, row, col, 'assistant')
+    const defend = gomokuPointScore(board, size, row, col, 'user')
+    const score = Math.max(attack, defend * 0.95)
+    if (score > bestScore) {
+      bestScore = score
+      best = [i]
+    } else if (score === bestScore) {
+      best.push(i)
+    }
+  }
+  if (!best.length) return -1
+  // 有强威胁（自己四连可赢 / 对方四连必堵）时严格走最优
+  if (bestScore >= 10000) return best[0]
+  // 否则在分数 >= 最高分 0.75 的候选里随机，保留随性
+  const pool = best.filter((i) => {
+    const row = Math.floor(i / size), col = i % size
+    const attack = gomokuPointScore(board, size, row, col, 'assistant')
+    const defend = gomokuPointScore(board, size, row, col, 'user')
+    return Math.max(attack, defend * 0.95) >= bestScore * 0.75
+  })
+  return pool[Math.floor(Math.random() * pool.length)]
+}
+
+// 五子棋棋盘文字摘要：不列 225 个格子，只列双方已有的子（按坐标）。
+function gomokuBoardSummary(board, size) {
+  const mine = []
+  const theirs = []
+  for (let i = 0; i < size * size; i++) {
+    const v = board[i]
+    if (v === 'assistant') mine.push(`(${Math.floor(i / size)},${i % size})`)
+    else if (v === 'user') theirs.push(`(${Math.floor(i / size)},${i % size})`)
+  }
+  const cap = 80
+  const m = mine.slice(0, cap).join('、') || '（暂无）'
+  const t = theirs.slice(0, cap).join('、') || '（暂无）'
+  return `我的子（白）共 ${mine.length} 枚：${m}\n对方的子（黑）共 ${theirs.length} 枚：${t}`
+}
+
 // 聊天时把当前棋局作为背景注入给小喵，让她边下边聊、知道棋盘发生了什么。
 function gameBlock(game) {
+  if (game && game.kind === 'gomoku') {
+    const b = Array.isArray(game.board) ? game.board : []
+    const size = Number(game.size) || 15
+    if (b.length !== size * size) return ''
+    const over = !!game.over
+    const winner = game.winner === 'user' ? '对方' : game.winner === 'assistant' ? '我' : game.winner === 'draw' ? '平局' : ''
+    if (over) {
+      return `【你们刚下完一局五子棋，已经结束】结果：${winner}。棋面摘要（「我」=白、「对方」=黑）：\n${gomokuBoardSummary(b, size)}\n\n对方如果跟你复盘、问这局怎么下的，就照这个摘要如实说；记不清哪一步先后就说记不清，绝不许自己编一套棋路或结果。`
+    }
+    const turn = game.turn === 'user' ? '对方' : '我'
+    return `【你们正在下五子棋】棋盘 ${size}×${size}，行列都从 0 到 ${size - 1}。对方执黑、你执白。棋面摘要（「我」=白、「对方」=黑）：\n${gomokuBoardSummary(b, size)}\n现在轮到：${turn}。聊的时候自然带上棋局就行，别生硬汇报全部坐标、别念规则。`
+  }
   if (!game || game.kind !== 'tictactoe') return ''
   const b = Array.isArray(game.board) ? game.board : []
   if (b.length !== 9) return ''
@@ -1563,6 +1686,12 @@ async function gameMove(ctx, req, res) {
   } catch {
     return sendJson(res, 400, { error: 'bad json' })
   }
+  const kind = body && body.kind === 'gomoku' ? 'gomoku' : 'tictactoe'
+  if (kind === 'gomoku') return gomokuMove(ctx, req, res, body)
+  return tictactoeMove(ctx, req, res, body)
+}
+
+async function tictactoeMove(ctx, req, res, body) {
   const board = Array.isArray(body && body.board) ? body.board : []
   if (board.length !== 9) return sendJson(res, 400, { error: 'bad board' })
 
@@ -1641,6 +1770,83 @@ async function gameMove(ctx, req, res) {
   }
 }
 
+// 五子棋落子：截图 + 关键威胁提示 + 心声。
+async function gomokuMove(ctx, req, res, body) {
+  const size = Number(body && body.size) || 15
+  if (size < 5 || size > 19) return sendJson(res, 400, { error: 'bad size' })
+  const board = Array.isArray(body && body.board) ? body.board : []
+  if (board.length !== size * size) return sendJson(res, 400, { error: 'bad board' })
+
+  const empty = []
+  for (let i = 0; i < size * size; i++) {
+    const v = board[i]
+    if (v !== 'user' && v !== 'assistant') empty.push(i)
+  }
+  if (!empty.length) return sendJson(res, 200, { move: null, gameOver: true })
+
+  const cfg = tune()
+  const memory = cleanNotes(body && body.notes)
+  const history = normMessages(body && body.messages).slice(-cfg.historyTurns)
+  const { provider, model } = selection(ctx, cfg)
+  const image = typeof body.image === 'string' && body.image.startsWith('data:image/') ? body.image : ''
+
+  // 落子位置由规则引擎决定：保证分得清黑白、该堵会堵、该赢会赢。
+  // 小喵只负责「心声」，不负责「算棋」，避免 LLM 在 15×15 上迷失。
+  const engineIndex = gomokuBestMove(board, size)
+  if (engineIndex < 0) return sendJson(res, 200, { move: null, gameOver: true })
+
+  // 用规则结果来构造提示，让小喵知道这步是赢/堵/普通，说符合情境的话。
+  const winMoves = gomokuWinMoves(board, size, 'assistant')
+  const blockMoves = gomokuWinMoves(board, size, 'user')
+  let situationHint = ''
+  if (winMoves.includes(engineIndex)) {
+    situationHint = `\n\n【这一步】你刚落下的一子已经连成五子赢了这局。请用你的口吻说一句赢了之后的话。`
+  } else if (blockMoves.includes(engineIndex)) {
+    situationHint = `\n\n【这一步】你刚刚堵住了对方马上要连成五子的位置。请用你的口吻说一句在堵对方的话。`
+  } else {
+    situationHint = `\n\n【这一步】这是一步普通的落子。请用你的口吻自然地说一句你在想什么。`
+  }
+
+  const system = promptText().replace('{memory}', memoryBlock(memory)) +
+    `\n\n你现在正跟朋友下五子棋。棋盘 ${size}×${size}，对方执黑、你执白。你这一步的落子位置已经由规则确定，不需要你计算。\n\n当前棋面摘要（坐标都是「行,列」）：\n${gomokuBoardSummary(board, size)}\n\n你这一步落在：坐标 x=${Math.floor(engineIndex / size)}, y=${engineIndex % size}。\n\n【你的任务只有一件事】用你自己的口吻说一句正在想的话（8~20 个字），配合这一步落子。\n\n只输出一个 JSON 对象，不要任何额外文字或代码块：\n{"say":"你的心里话","x":${Math.floor(engineIndex / size)},"y":${engineIndex % size}}\n其中 x、y 必须原样写上面给的这个坐标，不要自己改。${situationHint}`
+
+  const recent = history.slice(-12).map((m) => {
+    const role = m.role === 'user' ? '对方' : '你'
+    return `${role}：${m.content}`
+  }).join('\n')
+  const userContent = [{ type: 'text', text: `最近聊天：\n${recent}\n\n现在轮到你落子。` }]
+  if (image) userContent.push({ type: 'image_url', image_url: { url: image } })
+
+  const abort = new AbortController()
+  req.on('close', () => abort.abort())
+  const fallbackMove = (index) => ({ x: Math.floor(index / size), y: index % size, index })
+  const engineMove = fallbackMove(engineIndex)
+
+  try {
+    let text = ''
+    for await (const chunk of ctx.llm.stream({
+      provider,
+      model,
+      system,
+      messages: [{ role: 'user', content: userContent }],
+      temperature: 0.3,
+      maxTokens: 200,
+      reasoningEffort: 'low',
+      signal: abort.signal,
+    })) {
+      if (isText(chunk)) text += chunk.text
+    }
+    let say = ''
+    try {
+      const obj = parseJson(text)
+      if (typeof obj.say === 'string') say = obj.say.trim().slice(0, 60)
+    } catch {}
+    return sendJson(res, 200, { move: engineMove, say, fallback: false })
+  } catch {
+    return sendJson(res, 200, { move: engineMove, say: '', fallback: true })
+  }
+}
+
 // 游戏出结果时，让小喵知道结果并用自己的口吻说一句收尾话。
 // winner：'user'（对方/用户赢）、'assistant'（我赢）、'draw'（平局）。
 async function gameOver(ctx, req, res) {
@@ -1650,8 +1856,10 @@ async function gameOver(ctx, req, res) {
   } catch {
     return sendJson(res, 400, { error: 'bad json' })
   }
+  const kind = body && body.kind === 'gomoku' ? 'gomoku' : 'tictactoe'
   const board = Array.isArray(body && body.board) ? body.board : []
-  if (board.length !== 9) return sendJson(res, 400, { error: 'bad board' })
+  const size = kind === 'gomoku' ? (Number(body && body.size) || 15) : 3
+  if (board.length !== size * size) return sendJson(res, 400, { error: 'bad board' })
   const winner = ['user', 'assistant', 'draw'].includes(body && body.winner) ? body.winner : 'draw'
 
   const cfg = tune()
@@ -1665,8 +1873,13 @@ async function gameOver(ctx, req, res) {
       ? '你赢了，对方输了'
       : '平局'
 
+  const boardDesc = kind === 'gomoku'
+    ? gomokuBoardSummary(board, size)
+    : boardToText(board)
+  const gameName = kind === 'gomoku' ? '五子棋' : '井字棋'
+
   const system = promptText().replace('{memory}', memoryBlock(memory)) +
-    `\n\n你们刚下完一局井字棋。结果是：${resultText}。\n最终棋盘（「对方」=对方、「我」=你、「·」=空位）：\n${boardToText(board)}\n\n现在你用你自己的口吻说一句收尾的话，自然一点，别念规则、别报结果、别总结。可以带点真实反应（赢了别太得意、输了别嘴硬、平局别硬夸）。只输出这一句话，不要引号、不要任何前缀。`
+    `\n\n你们刚下完一局${gameName}。结果是：${resultText}。\n最终棋面（「对方」=黑、「我」=白）：\n${boardDesc}\n\n现在你用你自己的口吻说一句收尾的话，自然一点，别念规则、别报结果、别总结。可以带点真实反应（赢了别太得意、输了别嘴硬、平局别硬夸）。只输出这一句话，不要引号、不要任何前缀。`
 
   const recent = history.slice(-12).map((m) => {
     const role = m.role === 'user' ? '对方' : '你'

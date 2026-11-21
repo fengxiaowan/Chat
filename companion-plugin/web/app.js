@@ -116,74 +116,96 @@
     window.dispatchEvent(new CustomEvent('companion-avatar', { detail: { state } }));
   }
 
-  // ---------- 下棋：小喵（语言模型）陪下井字棋 ----------
-  // 棋盘是纯前端渲染，落子决策来自后端 game-move（小喵本人），不是本地规则引擎。
+  // ---------- 下棋：井字棋 + 五子棋 ----------
+  // 棋盘用 canvas 渲染（五子棋 15×15 用 DOM 格子会卡），落子决策来自后端 game-move（小喵本人）。
   // 3D 形象已断开，不再参与；以后想恢复形象，见 git 历史里的 avatar.js。
-  const GAME_KEY = 'companion.game.tictactoe.v1';
-  const EMPTY_BOARD = () => Array(9).fill('');
-  const WIN_LINES = [
-    [0, 1, 2], [3, 4, 5], [6, 7, 8],
-    [0, 3, 6], [1, 4, 7], [2, 5, 8],
-    [0, 4, 8], [2, 4, 6],
-  ];
+  const GAME_KEY = 'companion.game.v2';
+  const TIC_KEY = 'companion.game.tictactoe.v1';
+  const GOMOKU_KEY = 'companion.game.gomoku.v1';
   const G = {
-    board: EMPTY_BOARD(),
-    turn: 'user',       // 用户先手
+    kind: 'tictactoe',   // 'tictactoe' | 'gomoku'
+    size: 3,
+    board: Array(9).fill(''),
+    turn: 'user',        // 用户先手
     over: false,
-    winner: '',         // 'user' | 'assistant' | 'draw'
+    winner: '',          // 'user' | 'assistant' | 'draw'
     busy: false,
+    lastMove: -1,
   };
   const boardEl = $('board');
   const gameStatusEl = $('game-status');
+  const gameTitleEl = $('game-title');
+
+  function makeBoard(size) { return Array(size * size).fill(''); }
+  function gameKey() { return G.kind === 'gomoku' ? GOMOKU_KEY : TIC_KEY; }
 
   function loadGame() {
-    const g = read(GAME_KEY, null);
-    if (g && Array.isArray(g.board) && g.board.length === 9) {
-      G.board = g.board.slice();
-      G.turn = g.turn === 'assistant' ? 'assistant' : 'user';
-      G.over = !!g.over;
-      G.winner = ['user', 'assistant', 'draw'].includes(g.winner) ? g.winner : '';
+    // 优先读新键，兼容旧键
+    const g = read(gameKey(), null) || read(GAME_KEY, null);
+    if (g && Array.isArray(g.board)) {
+      const size = Number(g.size) || (g.board.length === 225 ? 15 : g.board.length === 9 ? 3 : 0);
+      if (size === 3 || size === 15) {
+        G.kind = size === 15 ? 'gomoku' : 'tictactoe';
+        G.size = size;
+        G.board = g.board.slice();
+        G.turn = g.turn === 'assistant' ? 'assistant' : 'user';
+        G.over = !!g.over;
+        G.winner = ['user', 'assistant', 'draw'].includes(g.winner) ? g.winner : '';
+        G.lastMove = Number.isInteger(g.lastMove) ? g.lastMove : -1;
+      }
     }
   }
   function saveGame() {
-    write(GAME_KEY, { board: G.board, turn: G.turn, over: G.over, winner: G.winner });
+    write(gameKey(), { kind: G.kind, size: G.size, board: G.board, turn: G.turn, over: G.over, winner: G.winner, lastMove: G.lastMove });
   }
-  function checkWinner(board) {
-    for (const line of WIN_LINES) {
-      const [a, b, c] = line;
-      if (board[a] && board[a] === board[b] && board[b] === board[c]) {
-        return { winner: board[a], line };
+  function checkWinner(board, size) {
+    const win = size === 15 ? 5 : 3;
+    const dirs = [[0, 1], [1, 0], [1, 1], [1, -1]];
+    let winCells = null;
+    for (let i = 0; i < size * size; i++) {
+      const v = board[i];
+      if (!v) continue;
+      const r = Math.floor(i / size), c = i % size;
+      for (const [dr, dc] of dirs) {
+        const cells = [i];
+        for (let step = -1; step <= 1; step += 2) {
+          let rr = r + dr * step, cc = c + dc * step;
+          while (rr >= 0 && rr < size && cc >= 0 && cc < size && board[rr * size + cc] === v) {
+            cells.push(rr * size + cc);
+            rr += dr * step; cc += dc * step;
+          }
+        }
+        if (cells.length >= win) {
+          const uniq = [...new Set(cells)];
+          if (!winCells) return { winner: v, line: uniq };
+        }
       }
     }
     return board.every((v) => v) ? { winner: 'draw', line: null } : { winner: '', line: null };
   }
-  // 把棋盘画成一张图，发给后端让「她」真的看见棋盘
   function drawBoardImage() {
+    const size = G.size;
+    if (G.kind === 'tictactoe') return drawTicImage();
+    return drawGomokuImage(size);
+  }
+  function drawTicImage() {
     const SZ = 300;
     const cv = document.createElement('canvas');
-    cv.width = SZ;
-    cv.height = SZ;
+    cv.width = SZ; cv.height = SZ;
     const ctx = cv.getContext('2d');
     const cell = SZ / 3;
-    ctx.fillStyle = '#fdfaf7';
-    ctx.fillRect(0, 0, SZ, SZ);
-    // 网格线
-    ctx.strokeStyle = '#c9b8b0';
-    ctx.lineWidth = 4;
-    ctx.lineCap = 'round';
+    ctx.fillStyle = '#fdfaf7'; ctx.fillRect(0, 0, SZ, SZ);
+    ctx.strokeStyle = '#c9b8b0'; ctx.lineWidth = 4; ctx.lineCap = 'round';
     for (let k = 1; k < 3; k++) {
       const p = cell * k;
       ctx.beginPath(); ctx.moveTo(p, 0); ctx.lineTo(p, SZ); ctx.stroke();
       ctx.beginPath(); ctx.moveTo(0, p); ctx.lineTo(SZ, p); ctx.stroke();
     }
-    // 棋子：对方 X，自己 O
     for (let i = 0; i < 9; i++) {
       const v = G.board[i];
       if (!v) continue;
-      const r = Math.floor(i / 3);
-      const c = i % 3;
-      const cx = c * cell + cell / 2;
-      const cy = r * cell + cell / 2;
+      const r = Math.floor(i / 3), c = i % 3;
+      const cx = c * cell + cell / 2, cy = r * cell + cell / 2;
       ctx.lineWidth = 12;
       if (v === 'user') {
         ctx.strokeStyle = '#6f9ed9';
@@ -194,31 +216,64 @@
         ctx.stroke();
       } else {
         ctx.strokeStyle = '#d98b8b';
-        ctx.beginPath();
-        ctx.arc(cx, cy, cell * 0.27, 0, Math.PI * 2);
-        ctx.stroke();
+        ctx.beginPath(); ctx.arc(cx, cy, cell * 0.27, 0, Math.PI * 2); ctx.stroke();
+      }
+    }
+    return cv.toDataURL('image/png');
+  }
+  function drawGomokuImage(size) {
+    const SZ = size === 15 ? 600 : 300;
+    const cv = document.createElement('canvas');
+    cv.width = SZ; cv.height = SZ;
+    const ctx = cv.getContext('2d');
+    const pad = SZ / (size + 1) / 2;
+    const step = (SZ - pad * 2) / (size - 1);
+    ctx.fillStyle = '#f8f1ea'; ctx.fillRect(0, 0, SZ, SZ);
+    ctx.strokeStyle = '#c9b8b0'; ctx.lineWidth = size === 15 ? 2 : 4; ctx.lineCap = 'round';
+    for (let k = 0; k < size; k++) {
+      const p = pad + k * step;
+      ctx.beginPath(); ctx.moveTo(pad, p); ctx.lineTo(SZ - pad, p); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(p, pad); ctx.lineTo(p, SZ - pad); ctx.stroke();
+    }
+    for (let i = 0; i < size * size; i++) {
+      const v = G.board[i];
+      if (!v) continue;
+      const r = Math.floor(i / size), c = i % size;
+      const cx = pad + c * step, cy = pad + r * step;
+      if (v === 'user') {
+        ctx.fillStyle = '#2f2f2f'; ctx.beginPath(); ctx.arc(cx, cy, step * 0.38, 0, Math.PI * 2); ctx.fill();
+      } else {
+        ctx.fillStyle = '#f5f5f5'; ctx.beginPath(); ctx.arc(cx, cy, step * 0.38, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = '#d98b8b'; ctx.lineWidth = 2; ctx.stroke();
       }
     }
     return cv.toDataURL('image/png');
   }
   function renderBoard() {
     if (!boardEl) return;
+    const size = G.size;
     boardEl.innerHTML = '';
-    const winLine = G.winner && G.winner !== 'draw' ? WIN_LINES.find((l) => {
-      const [a, b, c] = l;
-      return G.board[a] && G.board[a] === G.board[b] && G.board[b] === G.board[c];
-    }) : null;
-    for (let i = 0; i < 9; i++) {
-      const cell = document.createElement('div');
-      cell.className = 'cell';
-      cell.setAttribute('role', 'gridcell');
-      const v = G.board[i];
-      if (v === 'user') { cell.textContent = '✕'; cell.classList.add('occupied', 'you'); }
-      else if (v === 'assistant') { cell.textContent = '◯'; cell.classList.add('occupied', 'me'); }
-      if (winLine && winLine.includes(i)) cell.classList.add('win');
-      cell.addEventListener('click', () => userMove(i));
-      boardEl.appendChild(cell);
+    // 井字棋：用 DOM 格子（✕ / ◯），保持原有观感
+    if (G.kind === 'tictactoe') {
+      boardEl.classList.remove('gomoku');
+      const winLine = G.winner && G.winner !== 'draw' ? (checkWinner(G.board, 3).line || []) : [];
+      for (let i = 0; i < 9; i++) {
+        const cell = document.createElement('div');
+        cell.className = 'cell';
+        cell.setAttribute('role', 'gridcell');
+        const v = G.board[i];
+        if (v === 'user') { cell.textContent = '✕'; cell.classList.add('occupied', 'you'); }
+        else if (v === 'assistant') { cell.textContent = '◯'; cell.classList.add('occupied', 'me'); }
+        if (winLine.includes(i)) cell.classList.add('win');
+        cell.addEventListener('click', () => userMove(i));
+        boardEl.appendChild(cell);
+      }
+    } else {
+      // 五子棋：canvas 黑白子
+      boardEl.classList.add('gomoku');
+      renderGomokuCanvas(boardEl, size);
     }
+    // 状态文字
     if (G.over) {
       if (G.winner === 'user') gameStatusEl.textContent = '你赢啦';
       else if (G.winner === 'assistant') gameStatusEl.textContent = '小喵赢啦';
@@ -228,26 +283,88 @@
       gameStatusEl.textContent = G.turn === 'user' ? '轮到你' : '小喵在想…';
     }
   }
+  function renderGomokuCanvas(container, size) {
+    const cv = document.createElement('canvas');
+    cv.width = cv.height = 600;
+    cv.style.width = '100%';
+    cv.style.height = '100%';
+    container.appendChild(cv);
+    const ctx = cv.getContext('2d');
+    const SZ = cv.width;
+    const pad = SZ / (size + 1) / 2;
+    const step = (SZ - pad * 2) / (size - 1);
+    ctx.fillStyle = '#f8f1ea'; ctx.fillRect(0, 0, SZ, SZ);
+    ctx.strokeStyle = '#c9b8b0'; ctx.lineWidth = size === 15 ? 2 : 4; ctx.lineCap = 'round';
+    for (let k = 0; k < size; k++) {
+      const p = pad + k * step;
+      ctx.beginPath(); ctx.moveTo(pad, p); ctx.lineTo(SZ - pad, p); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(p, pad); ctx.lineTo(p, SZ - pad); ctx.stroke();
+    }
+    // 五子棋画星位
+    ctx.fillStyle = '#c9b8b0';
+    for (const [r, c] of [[3,3],[3,11],[7,7],[11,3],[11,11]]) {
+      ctx.beginPath(); ctx.arc(pad + c * step, pad + r * step, 3, 0, Math.PI * 2); ctx.fill();
+    }
+    // 获胜连线高亮
+    const winLine = G.winner && G.winner !== 'draw' ? (checkWinner(G.board, size).line || []) : [];
+    if (winLine.length) {
+      ctx.strokeStyle = '#ffd24a'; ctx.lineWidth = size === 15 ? 5 : 6; ctx.lineCap = 'round';
+      ctx.beginPath();
+      winLine.forEach((idx, n) => {
+        const r = Math.floor(idx / size), c = idx % size;
+        const x = pad + c * step, y = pad + r * step;
+        if (n === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
+    // 棋子
+    for (let i = 0; i < size * size; i++) {
+      const v = G.board[i];
+      if (!v) continue;
+      const r = Math.floor(i / size), c = i % size;
+      const cx = pad + c * step, cy = pad + r * step;
+      if (v === 'user') {
+        ctx.fillStyle = '#2f2f2f'; ctx.beginPath(); ctx.arc(cx, cy, step * 0.4, 0, Math.PI * 2); ctx.fill();
+      } else {
+        ctx.fillStyle = '#f7f7f7'; ctx.beginPath(); ctx.arc(cx, cy, step * 0.4, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = '#d98b8b'; ctx.lineWidth = 2; ctx.stroke();
+      }
+    }
+    if (G.lastMove >= 0) {
+      const r = Math.floor(G.lastMove / size), c = G.lastMove % size;
+      ctx.strokeStyle = '#07c160'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(pad + c * step, pad + r * step, step * 0.5, 0, Math.PI * 2); ctx.stroke();
+    }
+    cv.addEventListener('click', (e) => {
+      const rect = cv.getBoundingClientRect();
+      const x = (e.clientX - rect.left) * (SZ / rect.width);
+      const y = (e.clientY - rect.top) * (SZ / rect.height);
+      const c = Math.round((x - pad) / step);
+      const r = Math.round((y - pad) / step);
+      if (r >= 0 && r < size && c >= 0 && c < size) userMove(r * size + c);
+    });
+  }
   function currentGame() {
-    return { kind: 'tictactoe', board: G.board, turn: G.turn, over: G.over, winner: G.winner };
+    return { kind: G.kind, size: G.size, board: G.board, turn: G.turn, over: G.over, winner: G.winner };
   }
   function resetGame() {
-    G.board = EMPTY_BOARD();
+    G.board = makeBoard(G.size);
     G.turn = 'user';
     G.over = false;
     G.winner = '';
     G.busy = false;
+    G.lastMove = -1;
     saveGame();
     renderBoard();
   }
-  // 让她先手：重置棋盘并立即由她走第一步
   async function aiFirst() {
     if (G.busy) return;
-    G.board = EMPTY_BOARD();
+    G.board = makeBoard(G.size);
     G.turn = 'assistant';
     G.over = false;
     G.winner = '';
     G.busy = false;
+    G.lastMove = -1;
     saveGame();
     renderBoard();
     await assistantMove();
@@ -255,6 +372,7 @@
   async function userMove(i) {
     if (G.over || G.busy || G.turn !== 'user' || G.board[i]) return;
     G.board[i] = 'user';
+    G.lastMove = i;
     G.turn = 'assistant';
     applyResult();
     saveGame();
@@ -263,12 +381,11 @@
     await assistantMove();
   }
   function applyResult() {
-    const r = checkWinner(G.board);
+    const r = checkWinner(G.board, G.size);
     G.winner = r.winner;
     G.over = !!r.winner;
     if (G.over) G.turn = '';
   }
-  // 游戏出结果时，让小喵知道结果并说一句收尾话
   async function announceResult() {
     if (!G.over) return;
     try {
@@ -276,6 +393,8 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          kind: G.kind,
+          size: G.size,
           board: G.board,
           winner: G.winner,
           notes: S.notes,
@@ -300,6 +419,8 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          kind: G.kind,
+          size: G.size,
           board: G.board,
           image,
           notes: S.notes,
@@ -310,10 +431,10 @@
       const d = await r.json();
       if (d && d.move && d.move.index != null && !G.board[d.move.index]) {
         G.board[d.move.index] = 'assistant';
+        G.lastMove = d.move.index;
         G.turn = 'user';
         applyResult();
         saveGame();
-        // 她的心声：像平时说话一样变成一条小气泡
         if (d.say) {
           addBubble('assistant', d.say);
           S.history.push({ role: 'assistant', content: d.say, ts: Date.now() });
@@ -322,28 +443,51 @@
       }
       if (G.over) announceResult();
     } catch {
-      // 落子失败不打断聊天；给用户一个能继续的局面
       G.turn = 'user';
     } finally {
       G.busy = false;
       renderBoard();
     }
   }
-  // 模式切换：下棋 / 形象（形象当前是隐藏壳，加载代码已断开）
+  // 模式切换：井字棋 / 五子棋 / 形象（形象已隐藏）
+  function switchGameMode(mode) {
+    const avatarShell = $('avatar-shell');
+    const gameShell = $('game-shell');
+    if (avatarShell) avatarShell.hidden = mode !== 'avatar';
+    if (gameShell) gameShell.hidden = mode === 'avatar';
+    if (mode === 'avatar') return;
+    const kind = mode === 'gomoku' ? 'gomoku' : 'tictactoe';
+    if (G.kind !== kind) {
+      G.kind = kind;
+      G.size = kind === 'gomoku' ? 15 : 3;
+      const saved = read(gameKey(), null);
+      if (saved && Array.isArray(saved.board) && saved.board.length === G.size * G.size) {
+        G.board = saved.board.slice();
+        G.turn = saved.turn === 'assistant' ? 'assistant' : 'user';
+        G.over = !!saved.over;
+        G.winner = ['user', 'assistant', 'draw'].includes(saved.winner) ? saved.winner : '';
+        G.lastMove = Number.isInteger(saved.lastMove) ? saved.lastMove : -1;
+      } else {
+        G.board = makeBoard(G.size);
+        G.turn = 'user';
+        G.over = false;
+        G.winner = '';
+        G.lastMove = -1;
+      }
+      if (gameTitleEl) gameTitleEl.textContent = kind === 'gomoku' ? '五子棋' : '井字棋';
+      renderBoard();
+    }
+    localStorage.setItem('companion.panelMode.v1', mode);
+  }
   document.querySelectorAll('.mode-tab').forEach((tab) => {
     tab.addEventListener('click', () => {
-      const mode = tab.dataset.mode;
       document.querySelectorAll('.mode-tab').forEach((t) => t.classList.toggle('active', t === tab));
-      const avatarShell = $('avatar-shell');
-      const gameShell = $('game-shell');
-      if (avatarShell) avatarShell.hidden = mode !== 'avatar';
-      if (gameShell) gameShell.hidden = mode !== 'game';
-      localStorage.setItem('companion.panelMode.v1', mode);
+      switchGameMode(tab.dataset.mode);
     });
   });
-  // 形象已隐藏，强制显示棋盘，避免历史遗留的 avatar 模式把棋盘藏起来
-  const savedMode = localStorage.getItem('companion.panelMode.v1') === 'avatar' ? 'game' : (localStorage.getItem('companion.panelMode.v1') || 'game');
-  localStorage.setItem('companion.panelMode.v1', 'game');
+  // 默认井字棋（形象已隐藏）
+  const savedMode = localStorage.getItem('companion.panelMode.v1') === 'gomoku' ? 'gomoku' : 'game';
+  localStorage.setItem('companion.panelMode.v1', savedMode);
   document.querySelectorAll('.mode-tab').forEach((t) => {
     if (t.dataset.mode === savedMode) t.click();
   });

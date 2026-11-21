@@ -402,7 +402,15 @@ footer {
     flex-direction: column;
     gap: 0;
   }
-  .side { display: none; }
+  /* 移动端：上下分布，上方棋盘、下方聊天 */
+  .side {
+    flex: 0 0 48%;
+    min-height: 0;
+    border-radius: 0;
+    box-shadow: none;
+  }
+  .companion-layout.collapsed .side { display: none; }
+  .companion-layout.collapsed .phone { width: 100%; max-width: none; }
   .phone {
     width: 100%;
     max-width: none;
@@ -412,4 +420,13 @@ footer {
     border-radius: 0;
     box-shadow: none;
   }
+  /* 棋盘在小屏幕上适度缩小 */
+  .board { width: min(210px, 62%); gap: 6px; }
+  .game-shell { gap: 7px; padding: 8px; justify-content: flex-start; overflow: auto; }
+  .game-shell .game-head { gap: 6px; }
+  .game-title { font-size: 14px; }
+  .game-status { font-size: 11px; }
+  .game-actions { flex-wrap: wrap; justify-content: center; }
+  .game-btn { font-size: 12px; padding: 5px 11px; }
+  .mode-tabs { padding: 5px 8px; }
 }

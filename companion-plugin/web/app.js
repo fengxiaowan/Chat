@@ -341,7 +341,9 @@
       localStorage.setItem('companion.panelMode.v1', mode);
     });
   });
-  const savedMode = localStorage.getItem('companion.panelMode.v1') || 'game';
+  // 形象已隐藏，强制显示棋盘，避免历史遗留的 avatar 模式把棋盘藏起来
+  const savedMode = localStorage.getItem('companion.panelMode.v1') === 'avatar' ? 'game' : (localStorage.getItem('companion.panelMode.v1') || 'game');
+  localStorage.setItem('companion.panelMode.v1', 'game');
   document.querySelectorAll('.mode-tab').forEach((t) => {
     if (t.dataset.mode === savedMode) t.click();
   });

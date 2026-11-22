@@ -24,6 +24,37 @@
     if (expandBtn) expandBtn.addEventListener('click', () => collapseBtn.click());
   }
 
+  // 拖拽分隔条调整侧栏与聊天区的上下比例（移动端）
+  const splitBar = $('split-bar');
+  if (splitBar && layout) {
+    let dragging = false;
+    const SPLIT_KEY = 'companion.splitHeight.v1';
+    const savedH = parseFloat(localStorage.getItem(SPLIT_KEY));
+    if (Number.isFinite(savedH) && savedH >= 20 && savedH <= 92) {
+      layout.style.setProperty('--side-h', savedH + '%');
+    }
+    splitBar.addEventListener('pointerdown', (e) => {
+      dragging = true;
+      splitBar.setPointerCapture && splitBar.setPointerCapture(e.pointerId);
+      e.preventDefault();
+    });
+    splitBar.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const rect = layout.getBoundingClientRect();
+      let pct = ((e.clientY - rect.top) / rect.height) * 100;
+      pct = Math.max(20, Math.min(92, pct));
+      layout.style.setProperty('--side-h', pct + '%');
+    });
+    const endDrag = () => {
+      if (!dragging) return;
+      dragging = false;
+      const pct = parseFloat(layout.style.getPropertyValue('--side-h')) || 72;
+      localStorage.setItem(SPLIT_KEY, String(pct));
+    };
+    splitBar.addEventListener('pointerup', endDrag);
+    splitBar.addEventListener('pointercancel', endDrag);
+  }
+
   const BASE = '/liao';
   const LS = {
     hist: 'companion.history.v3',
@@ -456,13 +487,20 @@
     const avatarShell = $('avatar-shell');
     const gameShell = $('game-shell');
     const memoShell = $('memo-shell');
+    const drawShell = $('draw-shell');
     if (avatarShell) avatarShell.hidden = mode !== 'avatar';
     if (gameShell) gameShell.hidden = mode !== 'game' && mode !== 'gomoku';
     if (memoShell) memoShell.hidden = mode !== 'memo';
+    if (drawShell) drawShell.hidden = mode !== 'draw';
     if (mode === 'avatar') return;
     if (mode === 'memo') {
       localStorage.setItem('companion.panelMode.v1', mode);
       loadMemoList();
+      return;
+    }
+    if (mode === 'draw') {
+      localStorage.setItem('companion.panelMode.v1', mode);
+      loadDraw();
       return;
     }
     const kind = mode === 'gomoku' ? 'gomoku' : 'tictactoe';
@@ -495,7 +533,7 @@
     });
   });
   // 默认井字棋（形象已隐藏）
-  const savedMode = ['gomoku', 'memo'].includes(localStorage.getItem('companion.panelMode.v1'))
+  const savedMode = ['gomoku', 'memo', 'draw'].includes(localStorage.getItem('companion.panelMode.v1'))
     ? localStorage.getItem('companion.panelMode.v1')
     : 'game';
   localStorage.setItem('companion.panelMode.v1', savedMode);
@@ -539,12 +577,72 @@
     if (!memoListEl) return;
     memoListEl.innerHTML = '';
     for (const m of M.list) {
+      const wrap = document.createElement('span');
+      wrap.className = 'memo-tab-wrap';
       const b = document.createElement('button');
       b.className = 'memo-tab-item' + (m.id === M.currentId ? ' active' : '');
       b.textContent = m.title || '未命名';
       b.addEventListener('click', () => selectMemo(m.id));
-      memoListEl.appendChild(b);
+      const edit = document.createElement('button');
+      edit.className = 'draw-list-edit';
+      edit.textContent = '改';
+      edit.title = '重命名';
+      edit.addEventListener('click', (e) => { e.stopPropagation(); memoInlineRename(wrap, m.id); });
+      wrap.appendChild(b);
+      wrap.appendChild(edit);
+      memoListEl.appendChild(wrap);
     }
+  }
+  // 就地重命名便签：标签变成输入框 + 存/取消
+  function memoInlineRename(wrap, id) {
+    const cur = M.list.find((x) => x.id === id);
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = (cur && cur.title && cur.title !== '未命名') ? cur.title : '';
+    input.className = 'mem-edit-input';
+    input.maxLength = 6;
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'mini';
+    save.textContent = '存';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'mini';
+    cancel.textContent = '取消';
+    wrap.innerHTML = '';
+    wrap.appendChild(input);
+    wrap.appendChild(save);
+    wrap.appendChild(cancel);
+    for (const el of [input, save, cancel]) {
+      el.addEventListener('click', (e) => e.stopPropagation());
+      el.addEventListener('dblclick', (e) => e.stopPropagation());
+    }
+    input.focus();
+    let done = false;
+    const finish = () => { if (!done) { done = true; renderMemoList(); } };
+    save.addEventListener('click', async () => {
+      const title = input.value.trim().slice(0, 6) || '未命名';
+      try {
+        const r = await fetch(BASE + '/memo', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'rename', id, title }),
+        });
+        if (r.ok) {
+          const d = await r.json();
+          if (d && d.memo) {
+            const i = M.list.findIndex((x) => x.id === id);
+            if (i >= 0) M.list[i].title = d.memo.title;
+          }
+        }
+      } catch {}
+      finish();
+    });
+    cancel.addEventListener('click', finish);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') save.click();
+      if (e.key === 'Escape') finish();
+    });
   }
   async function selectMemo(id, silent) {
     const seq = ++M.reqSeq;
@@ -699,6 +797,372 @@
   const memoAiWriteBtn = $('memo-ai-write');
   if (memoAiWriteBtn) memoAiWriteBtn.addEventListener('click', askMemoWrite);
   if (memoEditorEl) memoEditorEl.addEventListener('input', scheduleMemoSave);
+
+  // ---------- 画板 ----------
+  // 一张一张的画纸：可新建/切换/删除/重命名，服务端同步；默认自由画画。
+  const DRAW_KEY = 'companion.drawing.v1';
+  const D = {
+    id: '',
+    list: [],
+    strokes: [],
+    tool: 'pen',
+    drawing: false,
+    current: null,
+    color: '#5a4a3f',
+    size: 3,
+    reqSeq: 0,
+    loadedFromServer: false,
+    ready: false,
+  };
+  const drawCanvasEl = $('draw-canvas');
+  const drawStatusEl = $('draw-status');
+  const drawListEl = $('draw-list');
+
+  function drawId() {
+    if (!D.id) {
+      D.id = read('companion.drawing.current', '');
+      if (!D.id) D.id = 'draw-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+    }
+    return D.id;
+  }
+  function drawTitle(id) {
+    const item = D.list.find((x) => x.id === id);
+    return item ? (item.title || '未命名') : '未命名';
+  }
+  function renderDrawList() {
+    if (!drawListEl) return;
+    drawListEl.innerHTML = '';
+    for (const item of D.list) {
+      const wrap = document.createElement('span');
+      wrap.className = 'draw-list-item-wrap';
+      const b = document.createElement('button');
+      b.className = 'draw-list-item' + (item.id === D.id ? ' active' : '');
+      b.textContent = (item.title || '未命名') + ' ' + (item.strokes || 0) + '笔';
+      b.addEventListener('click', () => selectDraw(item.id));
+      const edit = document.createElement('button');
+      edit.className = 'draw-list-edit';
+      edit.textContent = '改';
+      edit.title = '重命名';
+      edit.addEventListener('click', (e) => { e.stopPropagation(); drawInlineRename(wrap, item.id); });
+      wrap.appendChild(b);
+      wrap.appendChild(edit);
+      drawListEl.appendChild(wrap);
+    }
+  }
+  // 就地重命名：标签变成输入框 + 存/取消
+  function drawInlineRename(wrap, id) {
+    // 临时禁用 wrap 的点击切换，防止输入框被重建掉
+    wrap.dataset.editing = '1';
+    const cur = drawTitle(id);
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = cur === '未命名' ? '' : cur;
+    input.className = 'mem-edit-input';
+    input.maxLength = 12;
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'mini';
+    save.textContent = '存';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'mini';
+    cancel.textContent = '取消';
+    wrap.innerHTML = '';
+    wrap.appendChild(input);
+    wrap.appendChild(save);
+    wrap.appendChild(cancel);
+    // 阻止点击输入框/按钮时冒泡触发 wrap 的 click（避免误切换）
+    for (const el of [input, save, cancel]) {
+      el.addEventListener('click', (e) => e.stopPropagation());
+      el.addEventListener('dblclick', (e) => e.stopPropagation());
+    }
+    input.focus();
+    let done = false;
+    const finish = () => { if (!done) { done = true; renderDrawList(); } };
+    save.addEventListener('click', async () => {
+      const title = input.value.trim().slice(0, 12) || '未命名';
+      try {
+        const r = await fetch(BASE + '/drawing', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'rename', id, title }),
+        });
+        if (r.ok) {
+          const d = await r.json();
+          if (d && d.drawing) {
+            const i = D.list.findIndex((x) => x.id === id);
+            if (i >= 0) D.list[i].title = d.drawing.title;
+          }
+        }
+      } catch {}
+      finish();
+    });
+    cancel.addEventListener('click', finish);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') save.click();
+      if (e.key === 'Escape') finish();
+    });
+  }
+  async function loadDrawList(preferredId) {
+    const seq = ++D.reqSeq;
+    try {
+      const r = await fetch(BASE + '/drawings', { cache: 'no-store' });
+      if (!r.ok) return;
+      const d = await r.json();
+      if (seq !== D.reqSeq) return;
+      D.list = Array.isArray(d.drawings) ? d.drawings : [];
+      renderDrawList();
+    } catch {}
+  }
+  async function selectDraw(id, silent) {
+    const seq = ++D.reqSeq;
+    try {
+      const r = await fetch(BASE + '/drawing?id=' + encodeURIComponent(id), { cache: 'no-store' });
+      if (!r.ok) return;
+      const d = await r.json();
+      if (seq !== D.reqSeq) return;
+      if (d && d.id) {
+        D.id = d.id;
+        D.strokes = Array.isArray(d.strokes) ? d.strokes : [];
+        D.loadedFromServer = true;
+        D.ready = true;
+        renderDraw();
+        renderDrawList();
+        if (!silent) write('companion.drawing.current', D.id);
+      }
+    } catch {}
+  }
+  function renderDraw() {
+    if (!drawCanvasEl) return;
+    const cv = drawCanvasEl;
+    const wrap = cv.parentElement;
+    if (!wrap) return;
+    const side = Math.max(1, Math.floor(Math.min(wrap.clientWidth, wrap.clientHeight || wrap.clientWidth)));
+    if (side > 0 && (cv.width !== side || cv.height !== side)) {
+      cv.width = side;
+      cv.height = side;
+    }
+    const ctx = cv.getContext('2d');
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    ctx.fillStyle = '#fffdf7';
+    ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    for (const s of D.strokes) {
+      if (!s || !Array.isArray(s.points) || s.points.length < 1) continue;
+      const pts = s.points.map((p) => [p[0] * cv.width, p[1] * cv.height]);
+      ctx.strokeStyle = s.color || '#5a4a3f';
+      ctx.lineWidth = s.size || 3;
+      if (pts.length === 1) {
+        ctx.fillStyle = s.color || '#5a4a3f';
+        ctx.beginPath();
+        ctx.arc(pts[0][0], pts[0][1], (s.size || 3) / 2, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        ctx.beginPath();
+        ctx.moveTo(pts[0][0], pts[0][1]);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+        ctx.stroke();
+      }
+    }
+  }
+  function saveDraw() {
+    if (!D.ready) return;
+    try {
+      const id = drawId();
+      fetch(BASE + '/drawing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'save', id, strokes: D.strokes, title: drawTitle(id) }),
+      }).then(() => loadDrawList(id));
+      write('companion.drawing.current', id);
+      write(DRAW_KEY, D.strokes);
+    } catch {}
+  }
+  async function loadDraw() {
+    D.ready = false;
+    const id = read('companion.drawing.current', '');
+    if (id) D.id = id;
+    // 拉列表，确定要加载哪张
+    await loadDrawList();
+    let target = D.id;
+    if (!D.list.find((x) => x.id === target)) {
+      target = D.list.length ? D.list[0].id : '';
+    }
+    if (target) {
+      await selectDraw(target, true);
+    } else {
+      // 没有画纸：新建一张空的，并标记 ready，避免误保存覆盖
+      D.id = 'draw-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+      D.strokes = [];
+      D.ready = true;
+      write('companion.drawing.current', D.id);
+      renderDraw();
+    }
+  }
+  // 画布尺寸：用 ResizeObserver 跟随容器，修复刷新后压扁的问题
+  if (drawCanvasEl && typeof ResizeObserver !== 'undefined') {
+    const ro = new ResizeObserver(() => renderDraw());
+    const wrap = drawCanvasEl.parentElement;
+    if (wrap) ro.observe(wrap);
+  }
+  function toNorm(e, cv) {
+    const rect = cv.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / rect.width);
+    const y = ((e.clientY - rect.top) / rect.height);
+    return [Math.max(0, Math.min(1, x)), Math.max(0, Math.min(1, y))];
+  }
+  function exportDrawImage() {
+    try {
+      if (!D.strokes.length) return '';
+      const cv = document.createElement('canvas');
+      cv.width = cv.height = 640;
+      const ctx = cv.getContext('2d');
+      ctx.fillStyle = '#fffdf7';
+      ctx.fillRect(0, 0, cv.width, cv.height);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for (const s of D.strokes) {
+        if (!s || !Array.isArray(s.points) || s.points.length < 1) continue;
+        const pts = s.points.map((p) => [p[0] * cv.width, p[1] * cv.height]);
+        ctx.strokeStyle = s.color || '#5a4a3f';
+        ctx.lineWidth = (s.size || 3) * 3;
+        if (pts.length === 1) {
+          ctx.fillStyle = s.color || '#5a4a3f';
+          ctx.beginPath();
+          ctx.arc(pts[0][0], pts[0][1], (s.size || 3), 0, Math.PI * 2);
+          ctx.fill();
+        } else {
+          ctx.beginPath();
+          ctx.moveTo(pts[0][0], pts[0][1]);
+          for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+          ctx.stroke();
+        }
+      }
+      return cv.toDataURL('image/png');
+    } catch { return ''; }
+  }
+  if (drawCanvasEl) {
+    drawCanvasEl.addEventListener('pointerdown', (e) => {
+      if (D.tool === 'eraser') return;
+      e.preventDefault();
+      drawCanvasEl.setPointerCapture && drawCanvasEl.setPointerCapture(e.pointerId);
+      D.drawing = true;
+      D.current = {
+        kind: 'stroke',
+        points: [toNorm(e, drawCanvasEl)],
+        color: D.color,
+        size: D.size,
+        author: 'user',
+        ts: Date.now(),
+      };
+      D.strokes.push(D.current);
+      renderDraw();
+    });
+    drawCanvasEl.addEventListener('pointermove', (e) => {
+      if (!D.drawing || !D.current) return;
+      D.current.points.push(toNorm(e, drawCanvasEl));
+      renderDraw();
+    });
+    const endDraw = () => {
+      if (D.drawing) {
+        D.drawing = false;
+        D.current = null;
+        saveDraw();
+      }
+    };
+    drawCanvasEl.addEventListener('pointerup', endDraw);
+    drawCanvasEl.addEventListener('pointercancel', endDraw);
+    drawCanvasEl.addEventListener('click', (e) => {
+      if (D.tool === 'eraser') {
+        const [nx, ny] = toNorm(e, drawCanvasEl);
+        let best = -1;
+        let bestDist = 0.05;
+        D.strokes.forEach((s, i) => {
+          for (const p of (s.points || [])) {
+            const d = Math.hypot(p[0] - nx, p[1] - ny);
+            if (d < bestDist) { bestDist = d; best = i; }
+          }
+        });
+        if (best >= 0) {
+          D.strokes.splice(best, 1);
+          renderDraw();
+          saveDraw();
+        }
+      }
+    });
+  }
+  const penBtn = $('tool-pen');
+  const eraserBtn = $('tool-eraser');
+  if (penBtn && eraserBtn) {
+    penBtn.addEventListener('click', () => {
+      D.tool = 'pen';
+      penBtn.classList.add('active');
+      eraserBtn.classList.remove('active');
+      drawCanvasEl.style.cursor = 'crosshair';
+    });
+    eraserBtn.addEventListener('click', () => {
+      D.tool = 'eraser';
+      eraserBtn.classList.add('active');
+      penBtn.classList.remove('active');
+      drawCanvasEl.style.cursor = 'cell';
+    });
+  }
+  const undoBtn = $('draw-undo');
+  if (undoBtn) undoBtn.addEventListener('click', () => {
+    D.strokes.pop();
+    renderDraw();
+    saveDraw();
+  });
+  const clearBtn = $('draw-clear');
+  if (clearBtn) clearBtn.addEventListener('click', () => {
+    D.strokes = [];
+    renderDraw();
+    saveDraw();
+  });
+  const drawNewBtn = $('draw-new');
+  if (drawNewBtn) drawNewBtn.addEventListener('click', async () => {
+    if (D.id) saveDraw();
+    D.id = 'draw-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+    write('companion.drawing.current', D.id);
+    D.strokes = [];
+    D.loadedFromServer = true;
+    renderDraw();
+    renderDrawList();
+    saveDraw();
+  });
+  const drawDelBtn = $('draw-del');
+  if (drawDelBtn) drawDelBtn.addEventListener('click', async () => {
+    if (!D.id) return;
+    const id = D.id;
+    try {
+      const r = await fetch(BASE + '/drawing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'delete', id }),
+      });
+      if (!r.ok) return;
+      D.id = '';
+      D.strokes = [];
+      renderDraw();
+      localStorage.removeItem('companion.drawing.current');
+      await loadDrawList();
+    } catch {}
+  });
+  const drawShowBtn = $('draw-show');
+  if (drawShowBtn) drawShowBtn.addEventListener('click', () => {
+    if (!D.strokes.length) {
+      if (drawStatusEl) drawStatusEl.textContent = '还没有画呢';
+      setTimeout(() => { if (drawStatusEl) drawStatusEl.textContent = ''; }, 1500);
+      return;
+    }
+    const img = exportDrawImage();
+    if (!img) return;
+    pendingImages.push(img);
+    input.value = '你看我画了什么？';
+    autosize();
+    send();
+  });
 
   let ttsAudio = null;
   let playingEl = null;
@@ -1236,6 +1700,10 @@
           content: memoText.slice(0, 12000),
           events: M.authors || [],
         };
+      }
+      // 带上画板截图，让她真的看到你画了什么
+      if (drawCanvasEl && D.strokes.length) {
+        payload.drawingImage = exportDrawImage();
       }
       if (images && images.length) payload.images = images;
       const resp = await fetch(BASE + '/chat', {
@@ -1885,6 +2353,9 @@
     const lastMemoId = localStorage.getItem('companion.memo.current') || '';
     if (lastMemoId) M.currentId = lastMemoId;
     loadMemoList(lastMemoId);
+
+    // 画板：恢复画纸列表和当前画纸
+    loadDraw();
 
     // 先用本地缓存立刻上屏，绝不等网络。手机上走 Tailscale 拉一次要好几百毫秒到几秒，
     // 干等着就是那个「空白聊天窗口」。

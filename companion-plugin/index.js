@@ -28,6 +28,7 @@ const STATE_URL = new URL('state.json', MEMORY_URL)
 const IMAGES_URL = new URL('./images/', DATA_URL)
 const TTS_URL = new URL('./tts/', DATA_URL)
 const MEMOS_URL = new URL('./memos/', DATA_URL)
+const DRAWINGS_URL = new URL('./drawings/', DATA_URL)
 // 同一句语音可能同时被预取和播放请求命中。把生成任务合并，避免
 // 蜂窝网络抖动时重复启动 edge-tts，重复任务会互相抢带宽并延迟出声。
 const TTS_INFLIGHT = new Map()
@@ -215,6 +216,7 @@ function ensureDirs() {
   try { mkdirSync(DATA_URL, { recursive: true }) } catch {}
   try { mkdirSync(THREADS_URL, { recursive: true }) } catch {}
   try { mkdirSync(MEMOS_URL, { recursive: true }) } catch {}
+  try { mkdirSync(DRAWINGS_URL, { recursive: true }) } catch {}
 }
 
 function safeId(id) {
@@ -286,6 +288,16 @@ async function memoPost(req, res) {
     } catch (error) {
       return sendJson(res, 500, { error: String((error && error.message) || error).slice(0, 160) })
     }
+  }
+  if (action === 'rename') {
+    const id = safeId(body && body.id)
+    if (!id) return sendJson(res, 400, { error: 'bad id' })
+    const existing = readMemo(id)
+    if (!existing) return sendJson(res, 404, { error: 'memo not found' })
+    const title = String(body && body.title || '').trim().slice(0, 6) || '未命名'
+    const memo = { ...existing, title, updatedAt: new Date().toISOString() }
+    writeJsonUrl(memoUrl(id), memo)
+    return sendJson(res, 200, { ok: true, memo })
   }
   if (action !== 'save') return sendJson(res, 400, { error: 'bad action' })
 
@@ -391,6 +403,205 @@ async function memoWrite(ctx, req, res) {
   } catch (error) {
     return sendJson(res, 500, { error: String((error && error.message) || error).slice(0, 160) })
   }
+}
+
+// ---------- 画板 ----------
+
+function drawingUrl(id) {
+  return new URL(`${id}.json`, DRAWINGS_URL)
+}
+
+function loadDrawing(id) {
+  const d = readJsonUrl(drawingUrl(id), null)
+  if (d && typeof d === 'object') {
+    return {
+      id: String(d.id || id),
+      title: typeof d.title === 'string' ? d.title : '',
+      strokes: Array.isArray(d.strokes) ? d.strokes : [],
+      createdAt: typeof d.createdAt === 'string' ? d.createdAt : '',
+      updatedAt: typeof d.updatedAt === 'string' ? d.updatedAt : '',
+    }
+  }
+  return null
+}
+
+function listDrawings() {
+  ensureDirs()
+  let names = []
+  try { names = readdirSync(DRAWINGS_URL) } catch { return [] }
+  const out = []
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue
+    const d = readJsonUrl(new URL(name, DRAWINGS_URL), null)
+    if (!d || !d.id) continue
+    out.push({
+      id: d.id,
+      title: typeof d.title === 'string' ? d.title : '',
+      strokes: Array.isArray(d.strokes) ? d.strokes.length : 0,
+      createdAt: d.createdAt || '',
+      updatedAt: d.updatedAt || '',
+    })
+  }
+  out.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
+  return out
+}
+
+// 把她给的图形指令转成带手抖的笔迹（她决定画什么，引擎保证画得出来）
+function shapeToStroke(shape) {
+  // 图形库：circle / line / dot / triangle / flower
+  const kind = String(shape && shape.kind || 'circle')
+  const cx = Number(shape && shape.x) || 0.5
+  const cy = Number(shape && shape.y) || 0.5
+  const r = Math.min(0.4, Math.max(0.03, Number(shape && shape.r) || 0.15))
+  const jitter = (p, amp) => p + (Math.random() - 0.5) * amp
+  const pts = []
+  const N = 36
+  if (kind === 'circle') {
+    for (let i = 0; i <= N; i++) {
+      const a = (i / N) * Math.PI * 2
+      pts.push([jitter(cx + Math.cos(a) * r, 0.012), jitter(cy + Math.sin(a) * r, 0.012)])
+    }
+  } else if (kind === 'line') {
+    const x2 = Number(shape.x2) || (cx + r)
+    const y2 = Number(shape.y2) || cy
+    for (let i = 0; i <= 12; i++) {
+      const t = i / 12
+      pts.push([jitter(cx + (x2 - cx) * t, 0.008), jitter(cy + (y2 - cy) * t, 0.008)])
+    }
+  } else if (kind === 'dot') {
+    pts.push([cx, cy])
+  } else if (kind === 'triangle') {
+    const corners = [
+      [cx, cy - r],
+      [cx + r * 0.9, cy + r * 0.7],
+      [cx - r * 0.9, cy + r * 0.7],
+    ]
+    corners.forEach(([x, y]) => pts.push([x, y]))
+    pts.push(corners[0])
+  } else if (kind === 'flower') {
+    for (let p = 0; p < 6; p++) {
+      const a = (p / 6) * Math.PI * 2
+      pts.push([jitter(cx + Math.cos(a) * r, 0.01), jitter(cy + Math.sin(a) * r, 0.01)])
+      pts.push([cx, cy])
+    }
+  }
+  return {
+    kind: 'shape',
+    shape: kind,
+    points: pts,
+    color: '#6f9ed9',
+    size: 3,
+    author: 'assistant',
+    ts: Date.now(),
+  }
+}
+
+// 她画一笔：把画布截图 + 用户指令喂给她，她输出图形指令，后端转笔迹
+async function drawAi(ctx, req, res) {
+  let body
+  try {
+    body = await readJson(req)
+  } catch {
+    return sendJson(res, 400, { error: 'bad json' })
+  }
+  const id = safeId(body && body.id)
+  if (!id) return sendJson(res, 400, { error: 'bad id' })
+  const existing = loadDrawing(id) || { id, strokes: [], createdAt: new Date().toISOString(), updatedAt: '' }
+  const instruction = String(body && body.instruction || '').trim().slice(0, 500)
+  const image = typeof body.image === 'string' && body.image.startsWith('data:image/') ? body.image : ''
+  const cfg = tune()
+  const memory = cleanNotes(body && body.notes)
+  const history = normMessages(body && body.messages).slice(-cfg.historyTurns)
+  const { provider, model } = selection(ctx, cfg)
+
+  const system = promptText().replace('{memory}', memoryBlock(memory)) +
+    `\n\n你和朋友正在共用一张画板。对方可能画了一些东西，现在轮到你画一笔。\n\n你只能画这些简单图形之一：circle（圆）、line（直线）、dot（点）、triangle（三角形）、flower（花）。\n\n画布坐标都是 0~1：x 从左到右，y 从上到下。\n\n只输出一个 JSON 对象，不要任何其他文字：\n{"say":"用你自己的口吻说一句正在画什么","shape":{"kind":"circle","x":0.5,"y":0.5,"r":0.15}}\n其中 line 需要 x2、y2；其他图形只要 x、y、r。say 是 8~20 个字。`
+
+  const recent = history.slice(-12).map((m) => {
+    const role = m.role === 'user' ? '对方' : '你'
+    return `${role}：${m.content}`
+  }).join('\n')
+  const userContent = [{ type: 'text', text: `对方说：${instruction || '（没具体说，你顺着画）'}\n\n最近聊天：\n${recent}` }]
+  if (image) userContent.push({ type: 'image_url', image_url: { url: image } })
+
+  const abort = new AbortController()
+  req.on('close', () => abort.abort())
+
+  try {
+    let text = ''
+    for await (const chunk of ctx.llm.stream({
+      provider,
+      model,
+      system,
+      messages: [{ role: 'user', content: userContent }],
+      temperature: 0.7,
+      maxTokens: 120,
+      reasoningEffort: 'low',
+      signal: abort.signal,
+    })) {
+      if (isText(chunk)) text += chunk.text
+    }
+    let say = ''
+    let shape = null
+    try {
+      const obj = parseJson(text)
+      if (typeof obj.say === 'string') say = obj.say.trim().slice(0, 60)
+      if (obj.shape && typeof obj.shape.kind === 'string') shape = obj.shape
+    } catch {}
+    if (!shape) shape = { kind: 'dot', x: 0.5, y: 0.5, r: 0.08 }
+    const stroke = shapeToStroke(shape)
+    const strokes = existing.strokes.concat([stroke]).slice(-2000)
+    const drawing = { ...existing, strokes, updatedAt: new Date().toISOString() }
+    writeJsonUrl(drawingUrl(id), drawing)
+    return sendJson(res, 200, { stroke, say, drawing })
+  } catch (error) {
+    return sendJson(res, 500, { error: String((error && error.message) || error).slice(0, 160) })
+  }
+}
+
+async function drawingPost(req, res) {
+  let body
+  try {
+    body = await readJson(req)
+  } catch {
+    return sendJson(res, 400, { error: 'bad json' })
+  }
+  const action = String(body && body.action || 'save')
+  if (action === 'delete') {
+    const id = safeId(body && body.id)
+    if (!id) return sendJson(res, 400, { error: 'bad id' })
+    try {
+      rmSync(drawingUrl(id), { force: true })
+      return sendJson(res, 200, { ok: true, id })
+    } catch (error) {
+      return sendJson(res, 500, { error: String((error && error.message) || error).slice(0, 160) })
+    }
+  }
+  if (action === 'rename') {
+    const id = safeId(body && body.id)
+    if (!id) return sendJson(res, 400, { error: 'bad id' })
+    const existing = loadDrawing(id)
+    if (!existing) return sendJson(res, 404, { error: 'drawing not found' })
+    const title = String(body && body.title || '').trim().slice(0, 12) || '未命名'
+    const drawing = { ...existing, title, updatedAt: new Date().toISOString() }
+    writeJsonUrl(drawingUrl(id), drawing)
+    return sendJson(res, 200, { ok: true, drawing })
+  }
+  if (action !== 'save') return sendJson(res, 400, { error: 'bad action' })
+  ensureDirs()
+  const id = safeId(body && body.id) || 'draw-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6)
+  const existing = loadDrawing(id)
+  const strokes = Array.isArray(body && body.strokes) ? body.strokes.slice(0, 2000) : (existing ? existing.strokes : [])
+  const title = typeof body && typeof body.title === 'string' ? body.title.trim().slice(0, 12) : (existing ? existing.title : '')
+  const drawing = {
+    id,
+    title: title || '未命名',
+    strokes,
+    createdAt: String((body && body.createdAt) || (existing && existing.createdAt) || new Date().toISOString()),
+    updatedAt: new Date().toISOString(),
+  }
+  writeJsonUrl(drawingUrl(id), drawing)
+  return sendJson(res, 200, { ok: true, drawing })
 }
 
 function normMessages(list) {
@@ -1361,6 +1572,15 @@ async function serveGet(request) {
     const memo = readMemo(id)
     return memo ? jsonResponse(memo) : jsonResponse({ error: 'not found' }, 404)
   }
+  if (path === `${BASE}/drawing`) {
+    const id = safeId(url.searchParams.get('id'))
+    if (!id) return jsonResponse({ error: 'bad id' }, 400)
+    const drawing = loadDrawing(id)
+    return drawing ? jsonResponse(drawing) : jsonResponse({ error: 'not found' }, 404)
+  }
+  if (path === `${BASE}/drawings`) {
+    return jsonResponse({ drawings: listDrawings() })
+  }
   if (path === `${BASE}/tts`) {
     const text = (url.searchParams.get('text') || '').trim()
     if (!text || text.length > 300) return jsonResponse({ error: 'bad text' }, 400)
@@ -1387,7 +1607,7 @@ export function apply(ctx) {
   ensureDirs()
   const disposers = []
   disposers.push(ctx.webServer.register({ kind: 'prefix', path: BASE, resource: serveGet }))
-  for (const name of ['chat', 'notes', 'save', 'model', 'mem-edit', 'episode-edit', 'game-move', 'game-over', 'memo', 'memo-write']) {
+  for (const name of ['chat', 'notes', 'save', 'model', 'mem-edit', 'episode-edit', 'game-move', 'game-over', 'memo', 'memo-write', 'drawing', 'draw-ai']) {
     disposers.push(
       ctx.webServer.register({
         kind: 'exact',
@@ -1410,6 +1630,8 @@ async function handlePost(ctx, name, req, res) {
   if (name === 'game-over') return gameOver(ctx, req, res)
   if (name === 'memo') return memoPost(req, res)
   if (name === 'memo-write') return memoWrite(ctx, req, res)
+  if (name === 'drawing') return drawingPost(req, res)
+  if (name === 'draw-ai') return drawAi(ctx, req, res)
   if (name === 'notes') return notes(ctx, req, res)
   if (name === 'save') return save(ctx, req, res)
   if (name === 'model') return setModel(ctx, req, res)
@@ -1558,6 +1780,7 @@ async function chat(ctx, req, res) {
   const memory = cleanNotes(body && body.notes)
   const game = body && body.game ? body.game : null
   const memo = body && body.memo ? body.memo : null
+  const drawingImage = typeof body && body.drawingImage === 'string' && body.drawingImage.startsWith('data:image/') ? body.drawingImage : ''
   const full = normMessages(body && body.messages)
   const history = full.slice(-cfg.historyTurns)
   const imageList = Array.isArray(body && body.images)
@@ -1619,8 +1842,11 @@ async function chat(ctx, req, res) {
     for (;;) {
       attempt += 1
       try {
-        const userContent = [{ type: 'text', text: buildTranscript(history) }]
+        let transcriptText = buildTranscript(history)
+        if (drawingImage) transcriptText += '\n\n【注意】对方把画板上的涂鸦发给你看了，图在这条消息的附件里。这是一张随手画的简笔画，可能很粗糙。聊到画的内容时：\n· 先照图里真实看到的说（有几条线、几个形状、大概在什么位置）。\n· 然后用「看起来像……」的方式猜，允许说「像花」「像猫」但别下死结论。\n· 看不清或完全没认出来，就直说「我有点看不清」，绝不许编造图里根本没有的东西。'
+        const userContent = [{ type: 'text', text: transcriptText }]
         for (const u of validImages) userContent.push({ type: 'image_url', image_url: { url: u } })
+        if (drawingImage) userContent.push({ type: 'image_url', image_url: { url: drawingImage } })
         const options = {
           provider,
           model,

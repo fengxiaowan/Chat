@@ -4,6 +4,7 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs'
@@ -26,6 +27,7 @@ const EPISODES_URL = new URL('episodes.json', MEMORY_URL)
 const STATE_URL = new URL('state.json', MEMORY_URL)
 const IMAGES_URL = new URL('./images/', DATA_URL)
 const TTS_URL = new URL('./tts/', DATA_URL)
+const MEMOS_URL = new URL('./memos/', DATA_URL)
 // 同一句语音可能同时被预取和播放请求命中。把生成任务合并，避免
 // 蜂窝网络抖动时重复启动 edge-tts，重复任务会互相抢带宽并延迟出声。
 const TTS_INFLIGHT = new Map()
@@ -212,6 +214,7 @@ function backOffQuote(s, cutAt, minLen) {
 function ensureDirs() {
   try { mkdirSync(DATA_URL, { recursive: true }) } catch {}
   try { mkdirSync(THREADS_URL, { recursive: true }) } catch {}
+  try { mkdirSync(MEMOS_URL, { recursive: true }) } catch {}
 }
 
 function safeId(id) {
@@ -233,6 +236,161 @@ function readJsonUrl(url, fallback = null) {
 
 function writeJsonUrl(url, data) {
   writeFileSync(url, JSON.stringify(data), 'utf8')
+}
+
+// ---------- 便签纸 ----------
+
+function memoUrl(id) {
+  return new URL(`${id}.json`, MEMOS_URL)
+}
+
+function listMemos() {
+  ensureDirs()
+  let names = []
+  try { names = readdirSync(MEMOS_URL) } catch { return [] }
+  const out = []
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue
+    const data = readJsonUrl(new URL(name, MEMOS_URL), null)
+    if (!data || !data.id) continue
+    out.push({
+      id: data.id,
+      title: String(data.title || '').slice(0, 6) || '未命名',
+      content: String(data.content || ''),
+      createdAt: data.createdAt || '',
+      updatedAt: data.updatedAt || '',
+    })
+  }
+  out.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
+  return out
+}
+
+function readMemo(id) {
+  return readJsonUrl(memoUrl(id), null)
+}
+
+async function memoPost(req, res) {
+  let body
+  try {
+    body = await readJson(req)
+  } catch {
+    return sendJson(res, 400, { error: 'bad json' })
+  }
+  const action = String(body && body.action || 'save')
+  if (action === 'delete') {
+    const id = safeId(body && body.id)
+    if (!id) return sendJson(res, 400, { error: 'bad id' })
+    try {
+      rmSync(memoUrl(id), { force: true })
+      return sendJson(res, 200, { ok: true, id })
+    } catch (error) {
+      return sendJson(res, 500, { error: String((error && error.message) || error).slice(0, 160) })
+    }
+  }
+  if (action !== 'save') return sendJson(res, 400, { error: 'bad action' })
+
+  ensureDirs()
+  const id = safeId(body && body.id) || 'memo-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6)
+  const existing = readMemo(id)
+  const content = String(body && body.content || '').slice(0, 200000)
+  const title = String(body && body.title || (existing && existing.title) || '').slice(0, 6) || '未命名'
+  // 作者记录：这次保存是谁写的（user=对方，assistant=她），用于让她知道纸的来龙去脉，但不显示在纸上
+  const author = body && body.author === 'assistant' ? 'assistant' : 'user'
+  const oldContent = (existing && typeof existing.content === 'string') ? existing.content : ''
+  const prevEvents = (existing && Array.isArray(existing.events)) ? existing.events : []
+  let delta = ''
+  let edited = false
+  if (oldContent && content.startsWith(oldContent)) {
+    // 纯追加：delta 就是这次新写上去的部分
+    delta = content.slice(oldContent.length)
+  } else if (oldContent) {
+    // 不是纯追加（中间改动或删减）：无法精确归属，记录一次「修改」
+    edited = true
+  } else {
+    delta = content
+  }
+  const events = prevEvents.slice(-200)
+  if (edited || delta.trim()) {
+    events.push({ author, text: delta.trim().slice(0, 2000), edited: !!edited, at: new Date().toISOString() })
+  }
+  const memo = {
+    id,
+    title,
+    content,
+    events,
+    createdAt: String((body && body.createdAt) || (existing && existing.createdAt) || new Date().toISOString()),
+    updatedAt: new Date().toISOString(),
+  }
+  writeJsonUrl(memoUrl(id), memo)
+  return sendJson(res, 200, { ok: true, memo })
+}
+
+// 她写纸上：独立接口，严格 JSON 输出续写内容，不再依赖聊天里的魔法标记。
+async function memoWrite(ctx, req, res) {
+  let body
+  try {
+    body = await readJson(req)
+  } catch {
+    return sendJson(res, 400, { error: 'bad json' })
+  }
+  const id = safeId(body && body.id)
+  if (!id) return sendJson(res, 400, { error: 'bad id' })
+  const existing = readMemo(id)
+  if (!existing) return sendJson(res, 404, { error: 'memo not found' })
+  const instruction = String(body && body.instruction || '').trim().slice(0, 500)
+  const cfg = tune()
+  const memory = cleanNotes(body && body.notes)
+  const history = normMessages(body && body.messages).slice(-cfg.historyTurns)
+  const { provider, model } = selection(ctx, cfg)
+  const events = Array.isArray(existing.events) ? existing.events.slice(-30) : []
+  const eventText = events.map((e) => {
+    const who = e.author === 'assistant' ? '你（我）' : '对方'
+    return `${who}写了：${String(e.text || '').trim().slice(0, 300)}`
+  }).join('\n')
+  const currentText = String(existing.content || '').trim().slice(0, 12000)
+
+  const system = promptText().replace('{memory}', memoryBlock(memory)) +
+    `\n\n你和朋友正在共同写一张便签纸。你现在要往纸上续写一段。\n\n【这张纸的来龙去脉】\n${eventText || '（这张纸还没有内容）'}\n\n【当前纸上全文】\n${currentText || '（空白）'}\n\n【续写要求】\n· 接着纸上的内容往下写，用你自己的口吻，短句，别写成范文，别总结，别用「然而」「仿佛」。\n· 只写一小段（一两句），写不动就写到这句为止。\n· 你写的是新内容，绝不能复述、重复或抄写纸上已有的任何文字。\n· 如果对方明确说了想写什么方向，就顺着那个方向。\n\n只输出你要写到纸上的那段文字，不要引号、不要任何前缀、不要解释。`
+
+  const recent = history.slice(-12).map((m) => {
+    const role = m.role === 'user' ? '对方' : '你'
+    return `${role}：${m.content}`
+  }).join('\n')
+  const userContent = [{ type: 'text', text: `对方说：${instruction || '（没具体说，你顺着往下写）'}\n\n最近聊天：\n${recent}` }]
+
+  const abort = new AbortController()
+  req.on('close', () => abort.abort())
+
+  try {
+    let text = ''
+    for await (const chunk of ctx.llm.stream({
+      provider,
+      model,
+      system,
+      messages: [{ role: 'user', content: userContent }],
+      temperature: 0.8,
+      maxTokens: 300,
+      reasoningEffort: 'low',
+      signal: abort.signal,
+    })) {
+      if (isText(chunk)) text += chunk.text
+    }
+    const written = text.replace(/^["'「」\s]+|["'「」\s]+$/g, '').trim().slice(0, 4000)
+    if (!written) return sendJson(res, 200, { written: '' })
+    const merged = currentText ? currentText.replace(/\s+$/, '') + '\n\n' + written : written
+    const events2 = events.concat([{ author: 'assistant', text: written, edited: false, at: new Date().toISOString() }]).slice(-200)
+    const memo = {
+      ...existing,
+      content: merged,
+      title: String(existing.title || '').slice(0, 6) || '未命名',
+      events: events2,
+      updatedAt: new Date().toISOString(),
+    }
+    writeJsonUrl(memoUrl(id), memo)
+    return sendJson(res, 200, { written, memo })
+  } catch (error) {
+    return sendJson(res, 500, { error: String((error && error.message) || error).slice(0, 160) })
+  }
 }
 
 function normMessages(list) {
@@ -1194,6 +1352,15 @@ async function serveGet(request) {
     const eps = (mem.episodes || []).slice().reverse()
     return jsonResponse({ episodes: eps, summary: mem.summary, count: eps.length })
   }
+  if (path === `${BASE}/memos`) {
+    return jsonResponse({ memos: listMemos() })
+  }
+  if (path === `${BASE}/memo`) {
+    const id = safeId(url.searchParams.get('id'))
+    if (!id) return jsonResponse({ error: 'bad id' }, 400)
+    const memo = readMemo(id)
+    return memo ? jsonResponse(memo) : jsonResponse({ error: 'not found' }, 404)
+  }
   if (path === `${BASE}/tts`) {
     const text = (url.searchParams.get('text') || '').trim()
     if (!text || text.length > 300) return jsonResponse({ error: 'bad text' }, 400)
@@ -1220,7 +1387,7 @@ export function apply(ctx) {
   ensureDirs()
   const disposers = []
   disposers.push(ctx.webServer.register({ kind: 'prefix', path: BASE, resource: serveGet }))
-  for (const name of ['chat', 'notes', 'save', 'model', 'mem-edit', 'episode-edit', 'game-move', 'game-over']) {
+  for (const name of ['chat', 'notes', 'save', 'model', 'mem-edit', 'episode-edit', 'game-move', 'game-over', 'memo', 'memo-write']) {
     disposers.push(
       ctx.webServer.register({
         kind: 'exact',
@@ -1241,6 +1408,8 @@ async function handlePost(ctx, name, req, res) {
   if (name === 'chat') return chat(ctx, req, res)
   if (name === 'game-move') return gameMove(ctx, req, res)
   if (name === 'game-over') return gameOver(ctx, req, res)
+  if (name === 'memo') return memoPost(req, res)
+  if (name === 'memo-write') return memoWrite(ctx, req, res)
   if (name === 'notes') return notes(ctx, req, res)
   if (name === 'save') return save(ctx, req, res)
   if (name === 'model') return setModel(ctx, req, res)
@@ -1388,6 +1557,7 @@ async function chat(ctx, req, res) {
   const cfg = tune()
   const memory = cleanNotes(body && body.notes)
   const game = body && body.game ? body.game : null
+  const memo = body && body.memo ? body.memo : null
   const full = normMessages(body && body.messages)
   const history = full.slice(-cfg.historyTurns)
   const imageList = Array.isArray(body && body.images)
@@ -1454,7 +1624,9 @@ async function chat(ctx, req, res) {
         const options = {
           provider,
           model,
-          system: buildSystem(memory, recallStr, backStr, factsStr, history) + (gameBlock(game) ? '\n\n' + gameBlock(game) : '\n\n【关于棋局】如果对方提到下棋、复盘或这局怎么下的，你现在手上没有具体棋局面，直接说记不清或不知道，绝不许自己编造棋盘或结果。'),
+          system: buildSystem(memory, recallStr, backStr, factsStr, history)
+            + (gameBlock(game) ? '\n\n' + gameBlock(game) : '\n\n【关于棋局】如果对方提到下棋、复盘或这局怎么下的，你现在手上没有具体棋局面，直接说记不清或不知道，绝不许自己编造棋盘或结果。')
+            + (memoBlock(memo) ? '\n\n' + memoBlock(memo) : ''),
           messages: [{ role: 'user', content: userContent }],
           temperature: cfg.temperature,
           maxTokens: cfg.maxTokens,
@@ -1677,6 +1849,29 @@ function gameBlock(game) {
   }
   const turn = game.turn === 'user' ? '对方' : '我'
   return `【你们正在下井字棋】棋盘如下（「对方」=对方、「我」=你、「·」=空位）：\n${boardToText(b)}\n现在轮到：${turn}。聊的时候自然带上棋局就行，别生硬汇报棋盘、别念规则。`
+}
+
+// 聊天时把当前便签内容注入给小喵，让她能「看到」纸上写了什么。
+function memoBlock(memo) {
+  if (!memo || typeof memo.content !== 'string') return ''
+  const text = memo.content.trim().slice(0, 12000)
+  if (!text) {
+    return `【你们有一张空白的便签纸，还没写任何字】对方刚开了一张新纸。\n\n如果聊到这张纸，你可以自然地讨论；往纸上写字由系统单独处理，你不需要在聊天里输出任何特殊标记。`
+  }
+  // 用作者记录还原「这张纸是怎么写出来的」
+  const authors = (memo.events && Array.isArray(memo.events)) ? memo.events.slice(-30) : []
+  let history = ''
+  if (authors.length) {
+    const lines = authors.map((a) => {
+      const who = a.author === 'assistant' ? '你（我）' : '对方'
+      const piece = String(a.text || a.content || '').trim().slice(0, 300)
+      return piece ? `${who}写了：${piece}` : ''
+    })
+    history = lines.filter(Boolean).join('\n')
+  } else {
+    history = `（这张纸的完整内容是：）\n${text}`
+  }
+  return `【你们有一张正在写的便签纸】下面是这张纸的来龙去脉（谁写了什么）：\n${history}\n\n你现在看到的纸上内容是：\n${text}\n\n【你要记住】\n· 上面明确标了「你（我）写的」是你之前写过的，「对方写的」是对方写的，别记反。\n· 不要复述、重复或抄写对方已经写的内容，那会让对方觉得你在敷衍。\n· 聊到这张纸时，要像知道它的前因后果一样，而不是第一次看见。\n\n【关于往纸上写】现在往纸上写是由系统单独处理的（对方会点按钮触发），你在聊天里只需要讨论纸上的内容，不需要自己用任何标记去写纸。`
 }
 
 async function gameMove(ctx, req, res) {

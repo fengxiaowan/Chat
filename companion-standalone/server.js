@@ -124,15 +124,16 @@ applyPlugin(ctx)
 
 // ---------- 路由匹配 + HTTP 服务 ----------
 
-function matchRoute(pathname) {
-  // exact 优先
+function matchRoute(pathname, method) {
+  // exact 优先；但 exact 是 POST handler，prefix 是 GET 资源，方法不同不能混用
   for (const r of routes) {
-    if (r.kind === 'exact' && r.path === pathname) return r
+    if (r.kind === 'exact' && r.path === pathname && (!method || method !== 'GET')) return r
   }
   // prefix 里取最长匹配
   let best = null
   for (const r of routes) {
     if (r.kind !== 'prefix') continue
+    if (method && method !== 'GET') continue
     if (pathname === r.path || pathname.startsWith(r.path)) {
       if (!best || r.path.length > best.path.length) best = r
     }
@@ -162,7 +163,7 @@ const server = http.createServer(async (req, res) => {
       res.end()
       return
     }
-    const route = matchRoute(url.pathname)
+    const route = matchRoute(url.pathname, req.method)
     if (!route) {
       res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
       res.end('not found')

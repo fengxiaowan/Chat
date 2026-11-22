@@ -404,7 +404,9 @@
       if (!r.ok) return;
       const d = await r.json();
       if (d && d.say) {
-        addBubble('assistant', d.say);
+        prefetchTts(d.say);
+        const bubbleEl = addBubble('assistant', d.say);
+        enqueueTts(d.say, bubbleEl);
         S.history.push({ role: 'assistant', content: d.say, ts: Date.now() });
         scheduleSave(200);
       }
@@ -449,13 +451,20 @@
       renderBoard();
     }
   }
-  // 模式切换：井字棋 / 五子棋 / 形象（形象已隐藏）
+  // 模式切换：井字棋 / 五子棋 / 便签 / 形象（形象已隐藏）
   function switchGameMode(mode) {
     const avatarShell = $('avatar-shell');
     const gameShell = $('game-shell');
+    const memoShell = $('memo-shell');
     if (avatarShell) avatarShell.hidden = mode !== 'avatar';
-    if (gameShell) gameShell.hidden = mode === 'avatar';
+    if (gameShell) gameShell.hidden = mode !== 'game' && mode !== 'gomoku';
+    if (memoShell) memoShell.hidden = mode !== 'memo';
     if (mode === 'avatar') return;
+    if (mode === 'memo') {
+      localStorage.setItem('companion.panelMode.v1', mode);
+      loadMemoList();
+      return;
+    }
     const kind = mode === 'gomoku' ? 'gomoku' : 'tictactoe';
     if (G.kind !== kind) {
       G.kind = kind;
@@ -486,11 +495,210 @@
     });
   });
   // 默认井字棋（形象已隐藏）
-  const savedMode = localStorage.getItem('companion.panelMode.v1') === 'gomoku' ? 'gomoku' : 'game';
+  const savedMode = ['gomoku', 'memo'].includes(localStorage.getItem('companion.panelMode.v1'))
+    ? localStorage.getItem('companion.panelMode.v1')
+    : 'game';
   localStorage.setItem('companion.panelMode.v1', savedMode);
   document.querySelectorAll('.mode-tab').forEach((t) => {
     if (t.dataset.mode === savedMode) t.click();
   });
+
+  // ---------- 便签纸 ----------
+  // 第一步：纯文字便签，可新建/编辑/删除，服务端自动保存，电脑手机同步。
+  const M = {
+    list: [],
+    currentId: '',
+    authors: [],
+    pendingWrite: '',
+    saveTimer: null,
+    reqSeq: 0,
+  };
+  const memoListEl = $('memo-list');
+  const memoEditorEl = $('memo-editor');
+
+  async function loadMemoList(preferredId) {
+    const seq = ++M.reqSeq;
+    try {
+      const r = await fetch(BASE + '/memos', { cache: 'no-store' });
+      if (!r.ok) return;
+      const d = await r.json();
+      if (seq !== M.reqSeq) return;
+      M.list = Array.isArray(d.memos) ? d.memos : [];
+      renderMemoList();
+      if (preferredId) {
+        const m = M.list.find((x) => x.id === preferredId);
+        if (m && memoEditorEl && memoEditorEl.value === '') {
+          M.currentId = m.id;
+          memoEditorEl.value = m.content || '';
+          renderMemoList();
+        }
+      }
+    } catch {}
+  }
+  function renderMemoList() {
+    if (!memoListEl) return;
+    memoListEl.innerHTML = '';
+    for (const m of M.list) {
+      const b = document.createElement('button');
+      b.className = 'memo-tab-item' + (m.id === M.currentId ? ' active' : '');
+      b.textContent = m.title || '未命名';
+      b.addEventListener('click', () => selectMemo(m.id));
+      memoListEl.appendChild(b);
+    }
+  }
+  async function selectMemo(id, silent) {
+    const seq = ++M.reqSeq;
+    try {
+      // 切换前先保存当前编辑内容，避免丢失
+      if (memoEditorEl && memoEditorEl.value.trim()) {
+        await saveMemoNow();
+      }
+      const r = await fetch(BASE + '/memo?id=' + encodeURIComponent(id), { cache: 'no-store' });
+      if (!r.ok) return;
+      const memo = await r.json();
+      if (seq !== M.reqSeq) return;
+      if (memo && memo.id) {
+        M.currentId = memo.id;
+        if (memoEditorEl) memoEditorEl.value = memo.content || '';
+        M.authors = Array.isArray(memo.events) ? memo.events : (Array.isArray(memo.authors) ? memo.authors : []);
+        renderMemoList();
+        if (!silent) localStorage.setItem('companion.memo.current', memo.id);
+      }
+    } catch {}
+  }
+  async function saveMemoNow(author) {
+    if (!memoEditorEl) return;
+    const content = memoEditorEl.value;
+    // 空内容且还没有 id 时，不落盘，避免积累空便签
+    if (!content.trim() && !M.currentId) return;
+    const id = M.currentId || undefined;
+    const title = content.split('\n').find((l) => l.trim()) || '';
+    try {
+      const r = await fetch(BASE + '/memo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'save', id, content, title: title.slice(0, 6), author: author || 'user' }),
+      });
+      if (!r.ok) return;
+      const d = await r.json();
+      if (d && d.memo) {
+        M.currentId = d.memo.id;
+        M.authors = Array.isArray(d.memo.events) ? d.memo.events : (Array.isArray(d.memo.authors) ? d.memo.authors : M.authors);
+        localStorage.setItem('companion.memo.current', d.memo.id);
+        const i = M.list.findIndex((x) => x.id === d.memo.id);
+        const item = { id: d.memo.id, title: d.memo.title || '未命名', content: d.memo.content, createdAt: d.memo.createdAt, updatedAt: d.memo.updatedAt };
+        if (i >= 0) M.list[i] = item;
+        else M.list.unshift(item);
+        renderMemoList();
+      }
+    } catch {}
+  }
+  function scheduleMemoSave() {
+    clearTimeout(M.saveTimer);
+    M.saveTimer = setTimeout(saveMemoNow, 800);
+  }
+  async function newMemo() {
+    // 新建前先保存当前内容，避免丢掉刚写的东西
+    if (memoEditorEl && memoEditorEl.value.trim()) {
+      await saveMemoNow();
+    }
+    if (memoEditorEl) memoEditorEl.value = '';
+    M.currentId = '';
+    M.authors = [];
+    renderMemoList();
+    if (memoEditorEl) memoEditorEl.focus();
+  }
+  async function deleteMemo() {
+    if (!M.currentId) return;
+    const id = M.currentId;
+    try {
+      const r = await fetch(BASE + '/memo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'delete', id }),
+      });
+      if (!r.ok) return;
+      M.currentId = '';
+      if (memoEditorEl) memoEditorEl.value = '';
+      localStorage.removeItem('companion.memo.current');
+      await loadMemoList();
+    } catch {}
+  }
+  // 她写在纸上：把她写的内容追加到便签
+  async function applyMemoWrite(clean) {
+    clean = String(clean || '').trim();
+    if (!clean) return;
+    // 若还没有当前便签，先创建一个
+    if (!M.currentId && memoEditorEl) {
+      M.currentId = '';
+    }
+    let existing = '';
+    if (M.currentId) {
+      try {
+        const r = await fetch(BASE + '/memo?id=' + encodeURIComponent(M.currentId), { cache: 'no-store' });
+        if (r.ok) {
+          const memo = await r.json();
+          existing = memo && memo.content ? memo.content : '';
+        }
+      } catch {}
+    }
+    const merged = existing.trim() ? existing.replace(/\s+$/, '') + '\n\n' + clean : clean;
+    if (memoEditorEl) memoEditorEl.value = merged;
+    await saveMemoNow('assistant');
+  }
+  // 让她续写：调用独立接口，把她的续写落到纸上
+  async function askMemoWrite(instructionText) {
+    const statusEl = $('memo-status');
+    if (statusEl) statusEl.textContent = '小喵在想…';
+    if (!M.currentId) {
+      // 没有当前便签时，先把编辑器现有内容存成一张
+      if (memoEditorEl && memoEditorEl.value.trim()) {
+        await saveMemoNow('user');
+      }
+      if (!M.currentId) {
+        // 仍然没有（完全空白）：先创建一张空的
+        if (memoEditorEl) memoEditorEl.value = '';
+        M.currentId = '';
+        if (statusEl) statusEl.textContent = '';
+        return;
+      }
+    }
+    const instruction = instructionText || input.value.trim();
+    try {
+      const r = await fetch(BASE + '/memo-write', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: M.currentId,
+          instruction,
+          notes: S.notes,
+          messages: S.history.slice(-S.limit),
+        }),
+      });
+      if (!r.ok) { if (statusEl) statusEl.textContent = ''; return; }
+      const d = await r.json();
+      if (d && d.written) {
+        const memo = d.memo || null;
+        if (memoEditorEl && memo) memoEditorEl.value = memo.content || '';
+        if (memo) M.authors = Array.isArray(memo.events) ? memo.events : M.authors;
+        // 提示用户她写到了纸上
+        addBubble('assistant', '我写在纸上了：' + d.written);
+        S.history.push({ role: 'assistant', content: '我写在纸上了：' + d.written, ts: Date.now() });
+        scheduleSave(200);
+        await loadMemoList(M.currentId);
+      }
+    } catch {} finally {
+      if (statusEl) statusEl.textContent = '';
+    }
+  }
+  // 事件绑定
+  const memoNewBtn = $('memo-new');
+  if (memoNewBtn) memoNewBtn.addEventListener('click', newMemo);
+  const memoDelBtn = $('memo-del');
+  if (memoDelBtn) memoDelBtn.addEventListener('click', deleteMemo);
+  const memoAiWriteBtn = $('memo-ai-write');
+  if (memoAiWriteBtn) memoAiWriteBtn.addEventListener('click', askMemoWrite);
+  if (memoEditorEl) memoEditorEl.addEventListener('input', scheduleMemoSave);
 
   let ttsAudio = null;
   let playingEl = null;
@@ -979,6 +1187,9 @@
     if (!S.title) S.title = titleOf(S.history);
     scheduleSave(300);
     updateUsage();
+    // 用户让她把讨论结果写上去：聊天照常回复，之后自动触发写便签
+    const askWrite = /写(?:上去|进|到|在)(?:便签|纸上?)?|写到纸上|写上去|记(?:下来|到)(?:便签|纸上?)?|落到(?:便签|纸上?)?/.test(text);
+    if (askWrite && M.currentId) M.pendingWrite = text;
     runTurn(text, false, images);
   }
 
@@ -1016,6 +1227,16 @@
       const payload = { notes: S.notes, messages: S.history.slice(-S.limit) };
       // 无论棋局是否结束，都带上当前棋局面，让她能如实回顾，而不是凭印象瞎编
       payload.game = currentGame();
+      // 带上当前便签内容，让她能看到纸上写了什么
+      const memoText = memoEditorEl ? memoEditorEl.value.trim() : '';
+      // 只要有当前便签（哪怕空白纸），就发给她，让她知道有这张纸
+      if (memoText || M.currentId) {
+        payload.memo = {
+          id: M.currentId || '',
+          content: memoText.slice(0, 12000),
+          events: M.authors || [],
+        };
+      }
       if (images && images.length) payload.images = images;
       const resp = await fetch(BASE + '/chat', {
         method: 'POST',
@@ -1040,7 +1261,22 @@
             let evt;
             try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
             if (gen !== S.gen) return;
-            if (evt.type === 'bubble') { got += 1; S.queue.push(evt.text); if (autoPlay) prefetchTts(evt.text); wake(); armIdle(); }
+            if (evt.type === 'bubble') {
+              got += 1;
+              // 检测她往纸上写的标记：这行落便签，其余正常显示
+              const writeMatch = String(evt.text).match(/✍纸上[:：]\s*([\s\S]+?)(?:[。！？]|$)/);
+              if (writeMatch && writeMatch[1] && writeMatch[1].trim()) {
+                const written = writeMatch[1].trim();
+                applyMemoWrite(written);
+                // 同时以气泡形式提示用户，让她写的内容可见
+                S.queue.push('我写在纸上了：' + written);
+                if (autoPlay) prefetchTts('我写在纸上了：' + written);
+              } else {
+                S.queue.push(evt.text);
+                if (autoPlay) prefetchTts(evt.text);
+              }
+              wake(); armIdle();
+            }
             else if (evt.type === 'thinking') { if (!S.typing) showTyping(); armIdle(); }
             else if (evt.type === 'wait') { setTypingLabel(evt.text || '她那边有点挤，我排一下队…'); armIdle(); }
             else if (evt.type === 'error') { showError(evt.message, !!evt.quota); }
@@ -1085,6 +1321,12 @@
       if (got > 0 && gen === S.gen) {
         S.notesTick = (S.notesTick || 0) + 1;
         if (S.notesTick % 5 === 0) updateNotes();
+      }
+      // 用户让她把讨论结果写上去：聊天回复结束后自动落纸
+      if (!isRetry && gen === S.gen && M.pendingWrite && M.currentId) {
+        const instr = M.pendingWrite;
+        M.pendingWrite = '';
+        askMemoWrite(instr);
       }
     }
   }
@@ -1638,6 +1880,11 @@
     if (gameNewBtn) gameNewBtn.addEventListener('click', resetGame);
     const gameAiFirstBtn = $('game-ai-first');
     if (gameAiFirstBtn) gameAiFirstBtn.addEventListener('click', aiFirst);
+
+    // 便签：恢复上次打开的便签
+    const lastMemoId = localStorage.getItem('companion.memo.current') || '';
+    if (lastMemoId) M.currentId = lastMemoId;
+    loadMemoList(lastMemoId);
 
     // 先用本地缓存立刻上屏，绝不等网络。手机上走 Tailscale 拉一次要好几百毫秒到几秒，
     // 干等着就是那个「空白聊天窗口」。

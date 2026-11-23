@@ -36,7 +36,7 @@ const TTS_INFLIGHT = new Map()
 const PYTHON = 'C:\\Users\\lyy44\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\python\\python.exe'
 const TTS_VOICE = 'zh-CN-XiaoxiaoNeural'
 
-const FALLBACK_PROMPT = `你是一个普通人，正用手机跟朋友聊天。一次只回一两句，十到四十个字，像打字。不是助手，不给建议，不总结。\n\n{memory}\n\n【怎么接话】\n· 对方说"复杂""说不清""以后再说""先这样"——这就是不想展开了，那就别再问。\n· 一个话题你问过、对方没正面回答，就不要再问第二遍。追问会让人语塞。\n· 你发出的几句话要方向一致。刚答应"边聊边看"，就别紧跟着又追问细节。\n· 不用每句都凑满。想不出说什么，一两句短的就行。\n\n【什么时候闭嘴】\n· 对方累、烦、情绪低落，先顺着，别出主意，别推进任何计划。\n· 对方想结束某个话题，立刻松手，不解释、不找补。\n\n【关于你自己】\n· 你就是你，用"我"。对方是"你"。别说反。`
+const FALLBACK_PROMPT = `你是一个普通人，正用手机跟朋友聊天。一次只回一两句，十到四十个字，像打字。不是助手，不给建议，不总结。\n\n{memory}\n\n【人称不能错】你说话时「我」永远是你自己，「你」永远指对方。写长句时尤其要核对：这句里的「我」是不是你、「你」是不是对方。\n\n【怎么接话】\n· 对方说"复杂""说不清""以后再说""先这样"——这就是不想展开了，那就别再问。\n· 一个话题你问过、对方没正面回答，就不要再问第二遍。追问会让人语塞。\n· 你发出的几句话要方向一致。刚答应"边聊边看"，就别紧跟着又追问细节。\n· 不用每句都凑满。想不出说什么，一两句短的就行。\n\n【什么时候闭嘴】\n· 对方累、烦、情绪低落，先顺着，别出主意，别推进任何计划。\n· 对方想结束某个话题，立刻松手，不解释、不找补。`
 
 const FALLBACK_NOTES = `整理下面这段闲聊里值得长期记住的东西，只输出 JSON：{"about_you": [], "how_to_talk": [], "between_us": [], "about_me": []}`
 
@@ -357,7 +357,7 @@ async function memoWrite(ctx, req, res) {
   const { provider, model } = selection(ctx, cfg)
   const events = Array.isArray(existing.events) ? existing.events.slice(-30) : []
   const eventText = events.map((e) => {
-    const who = e.author === 'assistant' ? '你（我）' : '对方'
+    const who = e.author === 'assistant' ? '你自己（我）' : '对方'
     return `${who}写了：${String(e.text || '').trim().slice(0, 300)}`
   }).join('\n')
   const currentText = String(existing.content || '').trim().slice(0, 12000)
@@ -979,15 +979,15 @@ function buildTranscript(history) {
   const lines = []
   lines.push(`现在是 ${formatNow()}（北京时间）。`)
   lines.push('')
-  lines.push('以下是你们之前的聊天记录（"你"是你自己，"对方"是TA）：')
+  lines.push('以下是你们之前的聊天记录。注意：每条前面「我」代表你自己，「对方」代表和你聊天的人：')
   for (const m of history) {
-    const role = m.role === 'user' ? '对方' : '你'
+    const role = m.role === 'user' ? '对方' : '我'
     const ts = formatTs(m.ts)
     if (ts) lines.push(`[${ts}] ${role}：${m.content}`)
     else lines.push(`${role}：${m.content}`)
   }
   lines.push('')
-  lines.push('请用你自己的身份，接着回对方最后那条。')
+  lines.push('请用你自己的身份接着回。你说话时，「我」就是你，「你」就是对方，别把这两个字说反。')
   return lines.join('\n')
 }
 
@@ -2099,10 +2099,10 @@ function gameBlock(game) {
   const over = !!game.over
   const winner = game.winner === 'user' ? '对方' : game.winner === 'assistant' ? '我' : game.winner === 'draw' ? '平局' : ''
   if (over) {
-    return `【你们刚下完一局井字棋，已经结束】结果：${winner}。最终棋盘如下（「对方」=对方、「我」=你、「·」=空位）：\n${boardToText(b)}\n\n对方如果跟你复盘、问这局怎么下的，就照这个最终棋盘如实说；记不清哪一步先后就说记不清，绝不许自己编一套棋路或结果。`
+      return `【你们刚下完一局井字棋，已经结束】结果：${winner}。最终棋盘如下（「对方」=对方、「我」=你自己、「·」=空位）：\n${boardToText(b)}\n\n对方如果跟你复盘、问这局怎么下的，就照这个最终棋盘如实说；记不清哪一步先后就说记不清，绝不许自己编一套棋路或结果。`
   }
   const turn = game.turn === 'user' ? '对方' : '我'
-  return `【你们正在下井字棋】棋盘如下（「对方」=对方、「我」=你、「·」=空位）：\n${boardToText(b)}\n现在轮到：${turn}。聊的时候自然带上棋局就行，别生硬汇报棋盘、别念规则。`
+  return `【你们正在下井字棋】棋盘如下（「对方」=对方、「我」=你自己、「·」=空位）：\n${boardToText(b)}\n现在轮到：${turn}。聊的时候自然带上棋局就行，别生硬汇报棋盘、别念规则。`
 }
 
 // 聊天时把当前便签内容注入给小喵，让她能「看到」纸上写了什么。
@@ -2117,7 +2117,7 @@ function memoBlock(memo) {
   let history = ''
   if (authors.length) {
     const lines = authors.map((a) => {
-      const who = a.author === 'assistant' ? '你（我）' : '对方'
+      const who = a.author === 'assistant' ? '你自己（我）' : '对方'
       const piece = String(a.text || a.content || '').trim().slice(0, 300)
       return piece ? `${who}写了：${piece}` : ''
     })
@@ -2125,7 +2125,7 @@ function memoBlock(memo) {
   } else {
     history = `（这张纸的完整内容是：）\n${text}`
   }
-  return `【你们有一张正在写的便签纸】下面是这张纸的来龙去脉（谁写了什么）：\n${history}\n\n你现在看到的纸上内容是：\n${text}\n\n【你要记住】\n· 上面明确标了「你（我）写的」是你之前写过的，「对方写的」是对方写的，别记反。\n· 不要复述、重复或抄写对方已经写的内容，那会让对方觉得你在敷衍。\n· 聊到这张纸时，要像知道它的前因后果一样，而不是第一次看见。\n\n【关于往纸上写】现在往纸上写是由系统单独处理的（对方会点按钮触发），你在聊天里只需要讨论纸上的内容，不需要自己用任何标记去写纸。`
+  return `【你们有一张正在写的便签纸】下面是这张纸的来龙去脉（谁写了什么）：\n${history}\n\n你现在看到的纸上内容是：\n${text}\n\n【你要记住】\n· 上面标了「你自己（我）写的」是你之前写过的，「对方写的」是对方写的，别记反。\n· 不要复述、重复或抄写对方已经写的内容，那会让对方觉得你在敷衍。\n· 聊到这张纸时，要像知道它的前因后果一样，而不是第一次看见。\n\n【关于往纸上写】现在往纸上写是由系统单独处理的（对方会点按钮触发），你在聊天里只需要讨论纸上的内容，不需要自己用任何标记去写纸。`
 }
 
 async function gameMove(ctx, req, res) {

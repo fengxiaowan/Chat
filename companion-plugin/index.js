@@ -1495,14 +1495,30 @@ async function synthTts(text) {
     try { mkdirSync(TTS_URL, { recursive: true }) } catch {}
     const txt = new URL(hash + '.txt', TTS_URL)
     writeFileSync(txt, text, 'utf8')
-    await new Promise((resolve, reject) => {
-      execFile(
-        PYTHON,
-        ['-m', 'edge_tts', '--voice', voice, '--rate', rate, '--file', fileURLToPath(txt), '--write-media', fileURLToPath(mp3)],
-        { timeout: 30000 },
-        (err) => (err ? reject(err) : resolve()),
-      )
-    })
+    try {
+      await new Promise((resolve, reject) => {
+        execFile(
+          PYTHON,
+          ['-m', 'edge_tts', '--voice', voice, '--rate', rate, '--file', fileURLToPath(txt), '--write-media', fileURLToPath(mp3)],
+          { timeout: 30000 },
+          (err) => (err ? reject(err) : resolve()),
+        )
+      })
+    } catch (err) {
+      // 生成失败/超时：清掉可能残留的空文件，避免下次误当成已生成
+      try { rmSync(mp3, { force: true }) } catch {}
+      throw err
+    }
+    // 校验产物：空文件视为失败
+    try {
+      if (statSync(mp3).size < 1000) {
+        rmSync(mp3, { force: true })
+        throw new Error('tts output empty')
+      }
+    } catch (err) {
+      if (String(err && err.message) === 'tts output empty') throw err
+      throw err
+    }
     return mp3
   })()
   TTS_INFLIGHT.set(hash, job)

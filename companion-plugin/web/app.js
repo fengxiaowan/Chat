@@ -1267,6 +1267,7 @@
     avatarState('idle');
   }
   function playOne(text, bubbleEl, onEnd) {
+    console.log('[tts] 播放:', JSON.stringify(text).slice(0, 60));
     const a = getAudio();
     try { a.pause(); } catch {}
     if (playingEl) playingEl.classList.remove('playing');
@@ -1323,6 +1324,7 @@
   }
   function enqueueTts(text, bubbleEl) {
     if (!autoPlay) return;
+    console.log('[tts] 入队:', JSON.stringify(text).slice(0, 60));
     ttsQueue.push({ text, bubbleEl });
     if (!ttsQueueActive) pumpTtsQueue();
   }

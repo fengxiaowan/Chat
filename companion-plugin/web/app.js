@@ -2272,6 +2272,146 @@
     });
   }
 
+  // 聊天背景图：上传到服务端同步，应用到聊天窗口 + 全页背景
+  const bgToggle = $('bg-toggle');
+  const bgBody = $('bg-body');
+  if (bgToggle && bgBody) {
+    bgToggle.addEventListener('click', () => {
+      const open = bgBody.hidden;
+      bgBody.hidden = !open;
+      bgToggle.classList.toggle('open', open);
+    });
+  }
+  function applyBackground(url) {
+    const phone = document.querySelector('.phone');
+    if (url) {
+      if (phone) {
+        phone.style.backgroundImage = 'url("' + url + '")';
+        phone.style.backgroundSize = 'cover';
+        phone.style.backgroundPosition = 'center';
+        phone.style.backgroundRepeat = 'no-repeat';
+      }
+      document.body.classList.add('has-chat-bg');
+      document.body.style.backgroundImage = 'url("' + url + '")';
+    } else {
+      if (phone) {
+        phone.style.backgroundImage = '';
+        phone.style.backgroundSize = '';
+        phone.style.backgroundPosition = '';
+        phone.style.backgroundRepeat = '';
+      }
+      document.body.classList.remove('has-chat-bg');
+      document.body.style.backgroundImage = '';
+    }
+    const prev = $('bg-preview');
+    if (prev) {
+      if (url) {
+        prev.hidden = false;
+        prev.innerHTML = '';
+        const img = document.createElement('img');
+        img.src = url;
+        prev.appendChild(img);
+      } else {
+        prev.hidden = true;
+        prev.innerHTML = '';
+      }
+    }
+  }
+  // 启动时从服务端拉取背景
+  (async () => {
+    try {
+      const r = await fetch(BASE + '/chat-bg', { cache: 'no-store' });
+      if (r.ok) {
+        const d = await r.json();
+        if (d && d.hash) applyBackground(BASE + '/img/' + d.hash);
+      }
+    } catch {}
+  })();
+  const bgUploadBtn = $('bg-upload');
+  const bgFileInput = $('bg-file');
+  if (bgUploadBtn && bgFileInput) {
+    bgUploadBtn.addEventListener('click', () => bgFileInput.click());
+    bgFileInput.addEventListener('change', async () => {
+      const file = bgFileInput.files && bgFileInput.files[0];
+      if (!file || !file.type.startsWith('image/')) return;
+      const url = await compressImage(file);
+      if (url) {
+        try {
+          const r = await fetch(BASE + '/chat-bg', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'set', image: url }),
+          });
+          if (r.ok) {
+            const d = await r.json();
+            if (d && d.hash) applyBackground(BASE + '/img/' + d.hash);
+          }
+        } catch {}
+      }
+      bgFileInput.value = '';
+    });
+  }
+  const bgClearBtn = $('bg-clear');
+  if (bgClearBtn) {
+    bgClearBtn.addEventListener('click', () => {
+      try {
+        fetch(BASE + '/chat-bg', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'clear' }),
+        }).then(() => applyBackground(''));
+      } catch {}
+      applyBackground('');
+    });
+  }
+  // 背景缩放与位置微调（存 localStorage）
+  const BG_SET_KEY = 'companion.chatBgSettings.v1';
+  function applyBgSettings() {
+    const s = read(BG_SET_KEY, { scale: 135, pos: 62, posy: 50 });
+    const scale = Number(s.scale) || 135;
+    const pos = Number(s.pos) || 62;
+    const posy = Number(s.posy) || 50;
+    document.body.style.setProperty('--bg-scale', scale + '%');
+    document.body.style.setProperty('--bg-pos', pos + '% ' + posy + '%');
+    const sv = $('bg-scale-val');
+    const pv = $('bg-pos-val');
+    const pyv = $('bg-posy-val');
+    const sl = $('bg-scale');
+    const pl = $('bg-pos');
+    const pyl = $('bg-posy');
+    if (sv) sv.textContent = scale + '%';
+    if (pv) pv.textContent = pos + '%';
+    if (pyv) pyv.textContent = posy + '%';
+    if (sl) sl.value = scale;
+    if (pl) pl.value = pos;
+    if (pyl) pyl.value = posy;
+  }
+  applyBgSettings();
+  const bgScaleEl = $('bg-scale');
+  if (bgScaleEl) bgScaleEl.addEventListener('input', () => {
+    const scale = Number(bgScaleEl.value) || 135;
+    const s = read(BG_SET_KEY, { scale: 135, pos: 62, posy: 50 });
+    s.scale = scale;
+    write(BG_SET_KEY, s);
+    applyBgSettings();
+  });
+  const bgPosEl = $('bg-pos');
+  if (bgPosEl) bgPosEl.addEventListener('input', () => {
+    const pos = Number(bgPosEl.value) || 62;
+    const s = read(BG_SET_KEY, { scale: 135, pos: 62, posy: 50 });
+    s.pos = pos;
+    write(BG_SET_KEY, s);
+    applyBgSettings();
+  });
+  const bgPosyEl = $('bg-posy');
+  if (bgPosyEl) bgPosyEl.addEventListener('input', () => {
+    const posy = Number(bgPosyEl.value) || 50;
+    const s = read(BG_SET_KEY, { scale: 135, pos: 62, posy: 50 });
+    s.posy = posy;
+    write(BG_SET_KEY, s);
+    applyBgSettings();
+  });
+
   $('new').addEventListener('click', async () => {
     if (S.history.length && !confirm('开一段新的对话？现在这段会存进归档，随时能翻回来。')) return;
     await newThread();

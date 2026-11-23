@@ -29,6 +29,7 @@ const IMAGES_URL = new URL('./images/', DATA_URL)
 const TTS_URL = new URL('./tts/', DATA_URL)
 const MEMOS_URL = new URL('./memos/', DATA_URL)
 const DRAWINGS_URL = new URL('./drawings/', DATA_URL)
+const CHAT_BG_URL = new URL('chat-background.json', DATA_URL)
 // 同一句语音可能同时被预取和播放请求命中。把生成任务合并，避免
 // 蜂窝网络抖动时重复启动 edge-tts，重复任务会互相抢带宽并延迟出声。
 const TTS_INFLIGHT = new Map()
@@ -602,6 +603,27 @@ async function drawingPost(req, res) {
   }
   writeJsonUrl(drawingUrl(id), drawing)
   return sendJson(res, 200, { ok: true, drawing })
+}
+
+// 聊天背景：上传/清除（图片存 images 目录，记录 hash 供多设备同步）
+async function chatBgPost(req, res) {
+  let body
+  try {
+    body = await readJson(req)
+  } catch {
+    return sendJson(res, 400, { error: 'bad json' })
+  }
+  const action = String(body && body.action || 'set')
+  if (action === 'clear') {
+    writeJsonUrl(CHAT_BG_URL, { hash: '' })
+    return sendJson(res, 200, { ok: true, hash: '' })
+  }
+  const url = body && typeof body.image === 'string' ? body.image : ''
+  if (!url.startsWith('data:image/')) return sendJson(res, 400, { error: 'bad image' })
+  const hash = saveImage(url)
+  if (!hash) return sendJson(res, 400, { error: 'save failed' })
+  writeJsonUrl(CHAT_BG_URL, { hash })
+  return sendJson(res, 200, { ok: true, hash })
 }
 
 function normMessages(list) {
@@ -1581,6 +1603,11 @@ async function serveGet(request) {
   if (path === `${BASE}/drawings`) {
     return jsonResponse({ drawings: listDrawings() })
   }
+  if (path === `${BASE}/chat-bg`) {
+    const data = readJsonUrl(CHAT_BG_URL, null)
+    const hash = data && typeof data.hash === 'string' ? data.hash : ''
+    return jsonResponse({ hash })
+  }
   if (path === `${BASE}/tts`) {
     const text = (url.searchParams.get('text') || '').trim()
     if (!text || text.length > 300) return jsonResponse({ error: 'bad text' }, 400)
@@ -1607,7 +1634,7 @@ export function apply(ctx) {
   ensureDirs()
   const disposers = []
   disposers.push(ctx.webServer.register({ kind: 'prefix', path: BASE, resource: serveGet }))
-  for (const name of ['chat', 'notes', 'save', 'model', 'mem-edit', 'episode-edit', 'game-move', 'game-over', 'memo', 'memo-write', 'drawing', 'draw-ai']) {
+  for (const name of ['chat', 'notes', 'save', 'model', 'mem-edit', 'episode-edit', 'game-move', 'game-over', 'memo', 'memo-write', 'drawing', 'draw-ai', 'chat-bg']) {
     disposers.push(
       ctx.webServer.register({
         kind: 'exact',
@@ -1632,6 +1659,7 @@ async function handlePost(ctx, name, req, res) {
   if (name === 'memo-write') return memoWrite(ctx, req, res)
   if (name === 'drawing') return drawingPost(req, res)
   if (name === 'draw-ai') return drawAi(ctx, req, res)
+  if (name === 'chat-bg') return chatBgPost(req, res)
   if (name === 'notes') return notes(ctx, req, res)
   if (name === 'save') return save(ctx, req, res)
   if (name === 'model') return setModel(ctx, req, res)

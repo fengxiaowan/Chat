@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>闲聊</title>
-<link rel="stylesheet" href="/liao/style.css?v=20261122tabs">
+<link rel="stylesheet" href="/liao/style.css?v=20261123bg5">
 </head>
 <body>
 <div class="companion-layout" id="companion-layout">
@@ -19,7 +19,7 @@
     </nav>
 
     <section id="avatar-shell" class="avatar-shell" aria-label="虚拟形象" hidden>
-<img id="avatar-poster" class="avatar-poster" src="/liao/assets/avatar/Alicia-preview.png?v=20261122tabs" alt="Alicia 虚拟形象预览">
+<img id="avatar-poster" class="avatar-poster" src="/liao/assets/avatar/Alicia-preview.png?v=20261123bg5" alt="Alicia 虚拟形象预览">
       <canvas id="avatar-canvas"></canvas>
       <div class="avatar-badge">
         <span>Alicia</span>
@@ -126,6 +126,30 @@
     </div>
 
     <div class="field">
+      <button id="bg-toggle" class="field-toggle" type="button">聊天背景 <span class="arrow">▸</span></button>
+      <div id="bg-body" class="bg-body" hidden>
+        <div class="bg-row">
+          <button id="bg-upload" class="mini">上传图片</button>
+          <button id="bg-clear" class="mini">清除背景</button>
+          <input id="bg-file" type="file" accept="image/*" hidden>
+        </div>
+        <div id="bg-preview" class="bg-preview" hidden></div>
+        <div class="bg-row">
+          <label class="bg-slider-label">缩放 <span id="bg-scale-val">135%</span></label>
+          <input id="bg-scale" type="range" min="100" max="250" value="135">
+        </div>
+        <div class="bg-row">
+          <label class="bg-slider-label">左右 <span id="bg-pos-val">62%</span></label>
+          <input id="bg-pos" type="range" min="0" max="100" value="62">
+        </div>
+        <div class="bg-row">
+          <label class="bg-slider-label">上下 <span id="bg-posy-val">50%</span></label>
+          <input id="bg-posy" type="range" min="0" max="100" value="50">
+        </div>
+      </div>
+    </div>
+
+    <div class="field">
       <span>它记住的 <em class="tag">聊天里自己学的</em></span>
       <div id="mem" class="mem"></div>
       <button id="clear-mem" class="link">清空记忆</button>
@@ -149,7 +173,7 @@
   </div>
 </aside>
 
-<script src="/liao/app.js?v=20261122tabs"></script>
+<script src="/liao/app.js?v=20261123bg5"></script>
 <script>
   // 华为浏览器切回时可能回收页面进程；缓存页面壳，恢复后先把本地对话画出来。
   if ('serviceWorker' in navigator) {

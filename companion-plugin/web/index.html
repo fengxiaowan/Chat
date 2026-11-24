@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>闲聊</title>
-<link rel="stylesheet" href="/liao/style.css?v=20261124memfix">
+<link rel="stylesheet" href="/liao/style.css?v=20261124quote8">
 </head>
 <body>
 <div class="companion-layout" id="companion-layout">
@@ -20,7 +20,7 @@
     </nav>
 
     <section id="avatar-shell" class="avatar-shell" aria-label="虚拟形象" hidden>
-<img id="avatar-poster" class="avatar-poster" src="/liao/assets/avatar/Alicia-preview.png?v=20261124memfix" alt="Alicia 虚拟形象预览">
+<img id="avatar-poster" class="avatar-poster" src="/liao/assets/avatar/Alicia-preview.png?v=20261124quote8" alt="Alicia 虚拟形象预览">
       <canvas id="avatar-canvas"></canvas>
       <div class="avatar-badge">
         <span>Alicia</span>
@@ -97,6 +97,7 @@
         </div>
         <div class="actions">
           <button id="avatar-expand" class="gear" title="展开侧栏" hidden>ฅ</button>
+          <button id="search" class="gear" title="搜索聊天记录">🔍</button>
           <button id="new" class="gear" title="新对话">＋</button>
           <button id="gear" class="gear" title="设置">⚙</button>
         </div>
@@ -106,6 +107,10 @@
     <main id="list" class="list"></main>
 
     <footer>
+      <div id="quote-preview" class="quote-preview" hidden>
+        <span class="quote-preview-text"></span>
+        <button id="quote-preview-x" class="preview-x" title="移除">✕</button>
+      </div>
       <div id="preview" class="preview" hidden>
         <img id="preview-img" alt="预览">
         <button id="preview-x" class="preview-x" title="移除">✕</button>
@@ -164,14 +169,25 @@
     </div>
 
     <div class="field">
-      <span>它记住的 <em class="tag">聊天里自己学的</em></span>
-      <div id="mem" class="mem"></div>
-      <button id="clear-mem" class="link">清空记忆</button>
+      <button id="mem-toggle" class="field-toggle" type="button">它记住的 <em class="tag">聊天里自己学的</em> <span class="arrow">▸</span></button>
+      <div id="mem-body" hidden>
+        <div id="mem" class="mem"></div>
+        <button id="clear-mem" class="link">清空记忆</button>
+      </div>
     </div>
 
     <div class="field">
-      <span>事件卡 <em class="tag">聊天的浓缩记忆</em></span>
-      <div id="episodes" class="episodes"></div>
+      <button id="episodes-toggle" class="field-toggle" type="button">事件卡 <em class="tag">聊天的浓缩记忆</em> <span class="arrow">▸</span></button>
+      <div id="episodes-body" hidden>
+        <div id="episodes" class="episodes"></div>
+      </div>
+    </div>
+
+    <div class="field">
+      <button id="facts-toggle" class="field-toggle" type="button">人物词条 <em class="tag">长期事实</em> <span class="arrow">▸</span></button>
+      <div id="facts-body" hidden>
+        <div id="facts" class="facts"></div>
+      </div>
     </div>
 
     <div class="field">
@@ -187,8 +203,22 @@
   </div>
 </aside>
 
-<script src="/liao/vendor/wukong.js?v=20261124memfix"></script>
-<script src="/liao/app.js?v=20261124memfix"></script>
+<aside id="search-panel" class="search-panel">
+  <div class="search-inner">
+    <div class="panel-head">
+      <h2>搜索聊天记录</h2>
+      <button id="close-search" class="panel-close" title="关闭">✕</button>
+    </div>
+    <div class="search-box">
+      <input id="search-input" type="text" placeholder="输入关键词…">
+      <button id="search-go" class="mini">搜索</button>
+    </div>
+    <div id="search-results" class="search-results"></div>
+  </div>
+</aside>
+
+<script src="/liao/vendor/wukong.js?v=20261124quote8"></script>
+<script src="/liao/app.js?v=20261124quote8"></script>
 <script>
   // 华为浏览器切回时可能回收页面进程；缓存页面壳，恢复后先把本地对话画出来。
   if ('serviceWorker' in navigator) {

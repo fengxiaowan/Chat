@@ -67,6 +67,8 @@
 
   const S = {
     history: [],
+    total: 0,
+    hasMore: false,
     notes: normalizeNotes(EMPTY_NOTES),
     threadId: '',
     title: '',
@@ -152,6 +154,8 @@
     if (withTts) prefetchTts(text);
     const bubbleEl = addBubble('assistant', text);
     if (withTts) enqueueTts(text, bubbleEl);
+    // 写进短期上下文（她这几轮能接上），但打 game 标记，保存/事件卡时过滤
+    S.history.push({ role: 'assistant', content: text, ts: Date.now(), meta: { game: true } });
   }
 
   // ---------- 下棋：井字棋 + 五子棋 ----------
@@ -1933,11 +1937,44 @@
     step();
   }
 
-  function makeBubble(role, text, imgs) {
+  function makeBubble(role, text, imgs, meta, ts) {
     const row = document.createElement('div');
     row.className = 'row' + (role === 'user' ? ' mine' : '') + (role === 'err' ? ' err' : '');
+    if (ts) row.dataset.ts = String(ts);
     const b = document.createElement('div');
     b.className = 'bubble';
+    // 引用入口：电脑悬停显示，手机长按触发
+    let qbtn = null;
+    if (role !== 'err' && text) {
+      qbtn = document.createElement('button');
+      qbtn.type = 'button';
+      qbtn.className = 'bubble-quote-btn';
+      qbtn.textContent = '❝';
+      qbtn.title = '引用这句';
+      qbtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        startQuote(text, ts || '');
+      });
+      // 手机长按
+      let longTimer = null;
+      b.addEventListener('touchstart', () => {
+        longTimer = setTimeout(() => { startQuote(text, ts || ''); }, 450);
+      });
+      b.addEventListener('touchend', () => clearTimeout(longTimer));
+      b.addEventListener('touchmove', () => clearTimeout(longTimer));
+    }
+    // 引用块：像微信一样显示被引用的原文
+    if (meta && typeof meta.quote === 'string' && meta.quote) {
+      const q = document.createElement('div');
+      q.className = 'bubble-quote';
+      q.textContent = meta.quote;
+      q.title = '点击定位到原文';
+      q.addEventListener('click', (e) => {
+        e.stopPropagation();
+        locateQuotedMessage(meta.quoteTs);
+      });
+      b.appendChild(q);
+    }
     const list0 = Array.isArray(imgs) ? imgs : (imgs ? [imgs] : []);
     if (list0.length) {
       b.classList.add('img-bubble');
@@ -1957,7 +1994,12 @@
         b.appendChild(t);
       }
     } else {
-      b.textContent = text;
+      if (text) {
+        const t = document.createElement('div');
+        t.className = 'bubble-text';
+        t.textContent = text;
+        b.appendChild(t);
+      }
     }
     if (role === 'assistant') {
       b.classList.add('tts');
@@ -1965,11 +2007,13 @@
       b.addEventListener('click', () => toggleBubble(text, b));
     }
     row.appendChild(b);
+    // 引用按钮放在气泡内部，靠气泡定位，避免被 flex 推到窗口边缘
+    if (qbtn) b.appendChild(qbtn);
     return row;
   }
-  function addBubble(role, text, img) {
+  function addBubble(role, text, img, meta) {
     hideTyping();
-    const row = makeBubble(role, text, img);
+    const row = makeBubble(role, text, img, meta);
     list.appendChild(row);
     scrollBottom();
     if (role === 'user') avatarState('listening');
@@ -2030,7 +2074,7 @@
     const prevHeight = list.scrollHeight;
     const prevTop = list.scrollTop;
     list.innerHTML = '';
-    if (S.total > S.history.length) {
+    if (S.hasMore) {
       const more = document.createElement('div');
       more.className = 'load-more';
       more.textContent = '加载更早的聊天';
@@ -2039,7 +2083,7 @@
     }
     if (S.history.length) {
       addDivider(stamp());
-      for (const m of S.history) list.appendChild(makeBubble(m.role, m.content, m.imgs || m.img));
+      for (const m of S.history) list.appendChild(makeBubble(m.role, m.content, m.imgs || m.img, m.meta, m.ts));
       if (keepScroll) { list.scrollTop = list.scrollHeight - prevHeight + prevTop; followBottom = false; }
       else scrollBottom();
     }
@@ -2048,13 +2092,19 @@
 
   async function loadMore() {
     try {
-      const before = S.history.length;
-      const r = await fetch(BASE + '/current?limit=' + (before + 100));
+      // 用当前已加载里最早一条的时间戳做游标，向上翻页；避免靠「条数」估算，翻到中间会错位
+      const earliest = S.history.reduce((a, m) => {
+        const t = Number(m && m.ts) || 0;
+        return t > 0 && (a === 0 || t < a) ? t : a;
+      }, 0);
+      const before = earliest ? '&before=' + earliest : '';
+      const r = await fetch(BASE + '/current?limit=600' + before);
       if (!r.ok) return;
       const d = await r.json();
       if (!d || !Array.isArray(d.messages)) return;
       S.history = mergeMessages(d.messages, S.history);
       S.total = d.total || S.total;
+      S.hasMore = !!d.hasMore;
       renderAll(true);
     } catch {}
   }
@@ -2231,19 +2281,30 @@
   async function send() {
     const text = input.value.trim();
     const images = pendingImages.slice();
-    if (!text && !images.length) return;
+    const quoteText = pendingQuote ? pendingQuote.text : '';
+    const quoteTs = pendingQuote ? pendingQuote.ts : '';
+    if (!text && !images.length && !quoteText) return;
     unlockAudio();
     input.value = '';
     autosize();
+    const bubbleText = quoteText
+      ? (text ? text : '')
+      : text;
     if (images.length) {
-      addBubble('user', text, images);
-      const label = text || (images.length > 1 ? `（发了 ${images.length} 张图）` : '（发了张图）');
-      S.history.push({ role: 'user', content: label, ts: Date.now() });
+      addBubble('user', bubbleText, images, quoteText ? { quote: quoteText, quoteTs } : undefined);
     } else {
-      addBubble('user', text);
-      S.history.push({ role: 'user', content: text, ts: Date.now() });
+      addBubble('user', bubbleText, undefined, quoteText ? { quote: quoteText, quoteTs } : undefined);
     }
+    // 引用：content 存用户的文字，meta.quote 存被引用原文
+    S.history.push({
+      role: 'user',
+      content: bubbleText || '（引用）',
+      ts: Date.now(),
+      ...(quoteText ? { meta: { quote: quoteText, quoteTs } } : {}),
+    });
     pendingImages = [];
+    pendingQuote = null;
+    renderQuotePreview();
     renderPreviews();
     if (!S.title) S.title = titleOf(S.history);
     scheduleSave(300);
@@ -2251,7 +2312,7 @@
     // 用户让她把讨论结果写上去：聊天照常回复，之后自动触发写便签
     const askWrite = /写(?:上去|进|到|在)(?:便签|纸上?)?|写到纸上|写上去|记(?:下来|到)(?:便签|纸上?)?|落到(?:便签|纸上?)?/.test(text);
     if (askWrite && M.currentId) M.pendingWrite = text;
-    runTurn(text, false, images);
+    runTurn(bubbleText, false, images);
   }
 
   async function runTurn(text, isRetry, images) {
@@ -2579,6 +2640,93 @@
     if (!any) box.innerHTML = '<p class="mem-empty">还没记住什么，多聊几句就有了。</p>';
   }
 
+  // L0 人物词条渲染（默认折叠，可展开编辑）
+  async function renderFacts() {
+    const box = $('facts');
+    if (!box) return;
+    box.innerHTML = '<p class="mem-empty">读取中…</p>';
+    try {
+      const r = await fetch(BASE + '/facts', { cache: 'no-store' });
+      if (!r.ok) return;
+      const facts = await r.json();
+      box.innerHTML = '';
+      if (!Array.isArray(facts) || !facts.length) {
+        box.innerHTML = '<p class="mem-empty">还没有人物词条。</p>';
+        return;
+      }
+      for (const f of facts) {
+        if (!f || typeof f.key !== 'string') continue;
+        const div = document.createElement('div');
+        div.className = 'fact-item' + (f.sensitive ? ' fact-sensitive' : '');
+        const head = document.createElement('div');
+        head.className = 'fact-key';
+        head.textContent = f.key + (f.sensitive ? '（敏感）' : '');
+        const body = document.createElement('div');
+        body.className = 'fact-content';
+        body.textContent = (f.facts || []).join('；');
+        const edit = document.createElement('button');
+        edit.type = 'button';
+        edit.className = 'mini';
+        edit.textContent = '改';
+        edit.title = '编辑词条';
+        edit.addEventListener('click', () => factInlineEdit(div, f));
+        div.appendChild(head);
+        div.appendChild(body);
+        div.appendChild(edit);
+        box.appendChild(div);
+      }
+    } catch {}
+  }
+
+  // 词条就地编辑：改 key、facts（逗号分隔）、sensitive 开关
+  function factInlineEdit(div, f) {
+    const keyIn = document.createElement('input');
+    keyIn.type = 'text';
+    keyIn.value = f.key;
+    keyIn.className = 'mem-edit-input';
+    keyIn.placeholder = '关键词';
+    const factsIn = document.createElement('textarea');
+    factsIn.value = (f.facts || []).join('\n');
+    factsIn.className = 'mem-edit-input';
+    factsIn.placeholder = '每行一条事实';
+    factsIn.rows = 4;
+    const sensIn = document.createElement('label');
+    sensIn.className = 'checkbox';
+    sensIn.innerHTML = '<input type="checkbox"> 敏感（不主动提）';
+    sensIn.querySelector('input').checked = !!f.sensitive;
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'mini';
+    save.textContent = '存';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'mini';
+    cancel.textContent = '取消';
+    div.innerHTML = '';
+    div.appendChild(keyIn);
+    div.appendChild(factsIn);
+    div.appendChild(sensIn);
+    div.appendChild(save);
+    div.appendChild(cancel);
+    keyIn.focus();
+    let done = false;
+    const finish = () => { if (!done) { done = true; renderFacts(); } };
+    save.addEventListener('click', async () => {
+      const key = keyIn.value.trim();
+      const facts = factsIn.value.split('\n').map((s) => s.trim()).filter(Boolean);
+      if (!key) { finish(); return; }
+      try {
+        await fetch(BASE + '/facts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key, facts, sensitive: sensIn.querySelector('input').checked }),
+        });
+      } catch {}
+      finish();
+    });
+    cancel.addEventListener('click', finish);
+  }
+
   // 单条记忆就地编辑：把文字换成输入框 + 保存/取消
   function memInlineEdit(li, field, idx, oldText) {
     const input = document.createElement('input');
@@ -2728,16 +2876,66 @@
       const d = await (await fetch(BASE + '/episodes')).json();
       const items = d.episodes || [];
       box.innerHTML = '';
-      // 更早的事件卡会并入滚动摘要：在顶部显示出来，不让记忆「消失」
-      if (d.summary) {
-        const sum = document.createElement('div');
-        sum.className = 'episode-summary';
-        sum.textContent = '更早：' + d.summary;
-        box.appendChild(sum);
+      // 周归纳和月印象：展示古早记忆的沉降结果
+      const monthly = Array.isArray(d.monthly) ? d.monthly : [];
+      const weekly = Array.isArray(d.weekly) ? d.weekly : [];
+      if (monthly.length) {
+        const h = document.createElement('div');
+        h.className = 'episode-section-title';
+        h.textContent = '月印象';
+        box.appendChild(h);
+        for (const m of monthly) {
+          const div = document.createElement('div');
+          div.className = 'episode episode-archive';
+          if (Array.isArray(m.summary) && m.summary.length) {
+            div.innerHTML = '';
+            const monthEl = document.createElement('div');
+            monthEl.className = 'episode-theme';
+            monthEl.textContent = m.month || '';
+            div.appendChild(monthEl);
+            for (const s of m.summary) {
+              const line = document.createElement('div');
+              line.className = 'episode-content';
+              line.textContent = `${s.theme}：${s.content}`;
+              div.appendChild(line);
+            }
+          } else {
+            div.textContent = (m.month || '') + '：' + (m.themes || []).join('、');
+          }
+          box.appendChild(div);
+        }
+      }
+      if (weekly.length) {
+        const h = document.createElement('div');
+        h.className = 'episode-section-title';
+        h.textContent = '周归纳';
+        box.appendChild(h);
+        for (const w of weekly) {
+          const div = document.createElement('div');
+          div.className = 'episode episode-archive';
+          if (Array.isArray(w.summary) && w.summary.length) {
+            div.innerHTML = '';
+            const dayEl = document.createElement('div');
+            dayEl.className = 'episode-theme';
+            dayEl.textContent = w.day || '';
+            div.appendChild(dayEl);
+            for (const s of w.summary) {
+              const line = document.createElement('div');
+              line.className = 'episode-content';
+              line.textContent = `${s.theme}：${s.content}`;
+              div.appendChild(line);
+            }
+          } else {
+            div.textContent = (w.day || '') + '：' + (w.themes || []).join('、');
+          }
+          box.appendChild(div);
+        }
       }
       if (!items.length) {
-        box.innerHTML = '<p class="mem-empty">还没有事件卡，多聊几句就有了。</p>';
-        return;
+        if (!monthly.length && !weekly.length) {
+          box.innerHTML = '<p class="mem-empty">还没有事件卡，多聊几句就有了。</p>';
+          return;
+        }
       }
       for (const e of items) {
         const div = document.createElement('div');
@@ -2853,18 +3051,166 @@
     renderEpisodes();
   }
 
+
+  // ---------- 聊天记录搜索 + 引用 ----------
+  // 搜索命中后可以引用给 AI 看前后 10 句，并触发一次针对该主题的记忆补强。
+  const searchPanel = $('search-panel');
+  const searchInput = $('search-input');
+  const searchResults = $('search-results');
+  // 待发送的引用：{text, ts}
+  let pendingQuote = null;
+
+  function openSearch() {
+    if (!searchPanel) return;
+    searchPanel.classList.add('open');
+    if (searchInput) searchInput.focus();
+  }
+  function closeSearch() {
+    if (searchPanel) searchPanel.classList.remove('open');
+  }
+  const searchBtn = $('search');
+  if (searchBtn) searchBtn.addEventListener('click', openSearch);
+  const closeSearchBtn = $('close-search');
+  if (closeSearchBtn) closeSearchBtn.addEventListener('click', closeSearch);
+  if (searchPanel) searchPanel.addEventListener('click', (e) => { if (e.target === searchPanel) closeSearch(); });
+
+  async function doSearch() {
+    if (!searchInput || !searchResults) return;
+    const q = searchInput.value.trim();
+    if (!q) return;
+    searchResults.innerHTML = '<p class="mem-empty">搜索中…</p>';
+    try {
+      const r = await fetch(BASE + '/search-history?q=' + encodeURIComponent(q), { cache: 'no-store' });
+      if (!r.ok) return;
+      const d = await r.json();
+      const hits = d.hits || [];
+      searchResults.innerHTML = '';
+      if (!hits.length) {
+        searchResults.innerHTML = '<p class="mem-empty">没找到相关内容。</p>';
+        return;
+      }
+      hits.forEach((h) => {
+        const div = document.createElement('div');
+        div.className = 'search-hit';
+        const msg = document.createElement('div');
+        msg.className = 'hit-msg';
+        msg.textContent = h.message;
+        div.appendChild(msg);
+        const ctx = document.createElement('div');
+        ctx.className = 'hit-context';
+        (h.context || []).forEach((c) => {
+          const line = document.createElement('div');
+          line.className = 'hit-ctx-line' + (c.role === 'user' ? ' me' : '');
+          line.textContent = (c.role === 'user' ? '我：' : '小喵：') + c.content;
+          ctx.appendChild(line);
+        });
+        div.appendChild(ctx);
+        const quote = document.createElement('button');
+        quote.className = 'hit-quote';
+        quote.textContent = '引用给她看';
+        quote.addEventListener('click', () => quoteHit(h));
+        div.appendChild(quote);
+        searchResults.appendChild(div);
+      });
+    } catch {}
+  }
+  const searchGoBtn = $('search-go');
+  if (searchGoBtn) searchGoBtn.addEventListener('click', doSearch);
+  if (searchInput) searchInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); });
+
+  // 引用：把前后文发给她看，并触发记忆补强
+  async function quoteHit(h) {
+    closeSearch();
+    const quoteText = String(h.message || '').trim();
+    if (!quoteText) return;
+    startQuote(quoteText, h.ts || '');
+    if (searchInput) searchInput.value = '';
+  }
+
+  // 设置待引用内容并显示预览（供搜索引用和气泡引用共用）
+  function startQuote(text, ts) {
+    const t = String(text || '').trim();
+    if (!t) return;
+    pendingQuote = { text: t, ts: ts || '' };
+    renderQuotePreview();
+    input.focus();
+  }
+
+  function renderQuotePreview() {
+    const box = $('quote-preview');
+    const txt = box ? box.querySelector('.quote-preview-text') : null;
+    if (!box) return;
+    if (pendingQuote) {
+      box.hidden = false;
+      if (txt) txt.textContent = pendingQuote.text;
+    } else {
+      box.hidden = true;
+      if (txt) txt.textContent = '';
+    }
+  }
+  const quotePreviewX = $('quote-preview-x');
+  if (quotePreviewX) quotePreviewX.addEventListener('click', () => {
+    pendingQuote = null;
+    renderQuotePreview();
+  });
+
+  // 点击引用块：先到服务端按时间戳取原文前后文，再渲染并滚动高亮。
+  // 不依赖前端已经「翻到」哪里，直接定位，避免出现「看到的还是另一段对话」。
+  async function locateQuotedMessage(quoteTs) {
+    if (!quoteTs) return;
+    try {
+      const r = await fetch(BASE + '/current?around=' + encodeURIComponent(quoteTs) + '&pad=30', { cache: 'no-store' });
+      if (!r.ok) return;
+      const d = await r.json();
+      if (!d || !Array.isArray(d.messages)) return;
+      const targetIdx = d.messages.findIndex((m) => m && String(m.ts) === String(quoteTs));
+      if (targetIdx < 0) return;
+      // 用服务端返回的上下文替换当前历史，保证用户看到的就是这条原文所在的那一段
+      S.history = d.messages;
+      S.total = d.total || S.history.length;
+      S.hasMore = true;
+      renderAll(false);
+      // 渲染完成后再定位到目标行
+      requestAnimationFrame(() => {
+        const target = list.querySelector('.row[data-ts="' + CSS.escape(String(quoteTs)) + '"]');
+        if (target) {
+          target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          target.classList.add('locate-flash');
+          setTimeout(() => target.classList.remove('locate-flash'), 1800);
+        }
+      });
+    } catch {}
+  }
+
   // ---------- 设置 ----------
   $('gear').addEventListener('click', () => {
     renderMem();
     updateUsage();
     renderThreads();
     renderEpisodes();
+    renderFacts();
     panel.classList.add('open');
   });
   panel.addEventListener('click', (e) => { if (e.target === panel) panel.classList.remove('open'); });
   $('save').addEventListener('click', () => panel.classList.remove('open'));
   const closePanel = $('close-panel');
   if (closePanel) closePanel.addEventListener('click', () => panel.classList.remove('open'));
+
+  // 记忆区块折叠开关（默认全部收起）
+  function bindFoldToggle(toggleId, bodyId) {
+    const t = $(toggleId);
+    const b = $(bodyId);
+    if (t && b) {
+      t.addEventListener('click', () => {
+        const open = b.hidden;
+        b.hidden = !open;
+        t.classList.toggle('open', open);
+      });
+    }
+  }
+  bindFoldToggle('mem-toggle', 'mem-body');
+  bindFoldToggle('episodes-toggle', 'episodes-body');
+  bindFoldToggle('facts-toggle', 'facts-body');
 
   // 自动朗读开关
   const apEl = $('autoplay');
@@ -3108,6 +3454,7 @@
     const localHist = read(LS.hist, []);
     const localThread = read(LS.thread, '');    S.history = Array.isArray(localHist) ? localHist : [];
     S.total = S.history.length;
+    S.hasMore = false;
     S.notes = normalizeNotes(read(LS.notes, EMPTY_NOTES));
     S.threadId = localThread || newId();
     S.title = S.history.length ? titleOf(S.history) : '';
@@ -3147,6 +3494,7 @@
         const merged = mergeMessages(remote.messages, localHist);
         S.history = merged.length > CACHE_MAX ? merged.slice(-CACHE_MAX) : merged;
         S.total = remote.total || S.history.length;
+        S.hasMore = !!remote.hasMore;
         S.notes = normalizeNotes(remote.notes);
         S.threadId = remote.threadId || S.threadId;
         S.title = remote.title || S.title;

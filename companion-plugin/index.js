@@ -25,6 +25,7 @@ const CURRENT_URL = new URL('current.json', DATA_URL)
 const MEMORY_URL = new URL('./memory/', DATA_URL)
 const EPISODES_URL = new URL('episodes.json', MEMORY_URL)
 const STATE_URL = new URL('state.json', MEMORY_URL)
+const FACTS_URL = new URL('facts.json', MEMORY_URL)
 const IMAGES_URL = new URL('./images/', DATA_URL)
 const TTS_URL = new URL('./tts/', DATA_URL)
 const MEMOS_URL = new URL('./memos/', DATA_URL)
@@ -149,10 +150,12 @@ function episodesText() {
 const FIELDS = ['about_you', 'how_to_talk', 'between_us', 'about_me']
 const MAX_NOTES = 8
 // 分层记忆 / 事件卡参数
-const EPISODE_BATCH = 20        // 每累计约 10 轮(20 条)消息，批量压一次事件卡
+const EPISODE_BATCH = 30        // 每累计约 15 轮(30 条)消息，才批量压一次事件卡（提高门槛）
 const EPISODE_WINDOW = 40       // 每段（每次 LLM 调用）压缩的消息条数
 const EPISODE_BACKFILL_MAX = 30 // 单次后台最多压多少段，防历史太长一次跑不完
-const MAX_EPISODES = 200        // 事件卡超过该数量时，把最旧一批并进滚动摘要
+const MAX_EPISODES = 100        // L1 近期事件卡上限，超了向下沉降到 L2
+const EPISODE_SINK_DAYS = 60    // 超过 60 天的卡向下沉降
+const WEEKLY_MAX = 120          // L2 周归纳上限，超龄再沉到 L3
 const RECALL_K = 5             // 每轮主动回忆最多注入几条
 const RECALL_THRESHOLD = 0.28  // 相关分低于此值就不注入，省 token
 // 新鲜度衰减：2 个月线性衰减，别让「昨天的一句错话」压过「上周的正确记忆」。
@@ -750,6 +753,11 @@ function normMessages(list) {
     .slice(-MAX_STORED_MESSAGES)
 }
 
+// 过滤游戏心声，用于记忆/事件卡，避免棋局细节污染长期记忆；聊天短期上下文保留
+function normRealMessages(list) {
+  return normMessages(list).filter((m) => !(m && m.meta && m.meta.game))
+}
+
 function mergeByKey(existing, incoming) {
   const seen = new Set()
   const out = []
@@ -794,7 +802,8 @@ function imageFile(hash) {
 
 function saveThread(body) {
   ensureDirs()
-  const incoming = normMessages(body && body.messages)
+  // 存档剔除游戏心声：短期接话靠前端会话内 history，长期存档不落棋局细节
+  const incoming = normRealMessages(body && body.messages)
   const threadId = safeId(body && body.threadId) || 'thread-' + Date.now()
   const existing = readJsonUrl(threadUrl(threadId), null)
   const existingMessages = (existing && Array.isArray(existing.messages)) ? existing.messages : []
@@ -1127,14 +1136,88 @@ function loadMemory() {
       cursor: d.cursor && typeof d.cursor === 'object' ? d.cursor : {},
       episodes: Array.isArray(d.episodes) ? d.episodes : [],
       summary: typeof d.summary === 'string' ? d.summary : '',
+      weekly: Array.isArray(d.weekly) ? d.weekly : [],
+      monthly: Array.isArray(d.monthly) ? d.monthly : [],
     }
   }
-  return { cursor: {}, episodes: [], summary: '' }
+  return { cursor: {}, episodes: [], summary: '', weekly: [], monthly: [] }
 }
 
 function writeMemory(mem) {
   try { mkdirSync(MEMORY_URL, { recursive: true }) } catch {}
   writeJsonUrl(EPISODES_URL, mem)
+}
+
+// ---------- L0 人物事实层：永久词条，永不删 ----------
+
+function loadFacts() {
+  const d = readJsonUrl(FACTS_URL, null)
+  if (Array.isArray(d)) return d
+  if (d && typeof d === 'object' && Array.isArray(d.facts)) return d.facts
+  return []
+}
+
+function writeFacts(facts) {
+  try { mkdirSync(MEMORY_URL, { recursive: true }) } catch {}
+  writeJsonUrl(FACTS_URL, facts)
+}
+
+// 敏感词条：仅当用户消息里出现该词条的 key 时才展开，平时不注入
+function factsBlockForMessage(msg) {
+  const facts = loadFacts()
+  if (!facts.length) return ''
+  const text = String(msg || '')
+  const sensitive = []
+  const normal = []
+  for (const f of facts) {
+    if (!f || typeof f.key !== 'string') continue
+    if (f.sensitive) {
+      if (text.includes(f.key)) sensitive.push(f)
+    } else {
+      normal.push(f)
+    }
+  }
+  const pick = (list, max) => list.slice(0, max).map((f) =>
+    `· ${f.key}：${(f.facts || []).join('；')}`
+  ).join('\n')
+  // 普通词条常驻少量，敏感词条只在被提及时才注入
+  const parts = []
+  if (normal.length) parts.push('【你一直记得的对方的事实】\n' + pick(normal, 20))
+  if (sensitive.length) parts.push('【对方主动提到了这些，你才接着聊，平时别主动提】\n' + pick(sensitive, 8))
+  return parts.join('\n\n')
+}
+
+// 词条编辑/删除（设置面板用）
+async function factsPost(req, res) {
+  let body
+  try {
+    body = await readJson(req)
+  } catch {
+    return sendJson(res, 400, { error: 'bad json' })
+  }
+  const action = String(body && body.action || 'save')
+  const facts = loadFacts()
+  if (action === 'save') {
+    const key = String(body && body.key || '').trim().slice(0, 24)
+    const list = (Array.isArray(body && body.facts) ? body.facts : [])
+      .map((s) => String(s || '').trim().slice(0, 40))
+      .filter(Boolean)
+      .slice(0, 20)
+    if (!key || !list.length) return sendJson(res, 400, { error: 'bad facts' })
+    const idx = facts.findIndex((f) => f && f.key === key)
+    const item = { key, facts: list, sensitive: !!body.sensitive }
+    if (idx >= 0) facts[idx] = item
+    else facts.push(item)
+    writeFacts(facts)
+    return sendJson(res, 200, { ok: true, facts })
+  }
+  if (action === 'delete') {
+    const key = String(body && body.key || '').trim()
+    const next = facts.filter((f) => f && f.key !== key)
+    writeFacts(next)
+    return sendJson(res, 200, { ok: true, facts: next })
+  }
+  return sendJson(res, 400, { error: 'bad action' })
 }
 
 // ---------- 状态层：把「做了 / 没做」收拾成一小块 ----------
@@ -1201,17 +1284,81 @@ function parseEpisodes(text) {
     .filter((e) => e.theme || e.content)
 }
 
-function rollSummary(mem) {
+// L1 -> L2：把超量/超龄的事件卡按时间归档成「周归纳」，永不删除
+function sinkEpisodesToWeekly(mem) {
   const eps = mem.episodes || []
-  if (eps.length <= MAX_EPISODES) return
-  const overflow = eps.length - MAX_EPISODES
-  const old = eps.slice(0, overflow)
-  mem.episodes = eps.slice(overflow)
-  const themes = old.map((e) => e.theme).filter(Boolean)
-  if (themes.length) {
-    const line = '前期：' + themes.join('、')
-    mem.summary = (((mem.summary || '') + '；' + line).replace(/^；/, '')).slice(-MAX_SUMMARY)
+  const now = Date.now()
+  const keep = []
+  const sink = []
+  for (const e of eps) {
+    const age = e.ts ? (now - new Date(e.ts).getTime()) / 86400000 : 0
+    if (keep.length < MAX_EPISODES && age < EPISODE_SINK_DAYS) keep.push(e)
+    else sink.push(e)
   }
+  mem.episodes = keep
+  if (!sink.length) return sink
+  // 按天分组（没有 ts 的归到最早）
+  const byDay = new Map()
+  for (const e of sink) {
+    const day = e.ts ? String(e.ts).slice(0, 10) : 'early'
+    if (!byDay.has(day)) byDay.set(day, [])
+    byDay.get(day).push(e)
+  }
+  // 合并到现有 weekly，去重按天
+  const weekly = Array.isArray(mem.weekly) ? mem.weekly : []
+  const weeklyMap = new Map(weekly.map((w) => [String(w.day || ''), w]))
+  for (const [day, items] of byDay) {
+    const prev = weeklyMap.get(day)
+    const lines = items.map((e) => `${e.theme}：${e.content}`).join('\n')
+    if (prev) {
+      prev.themes = Array.from(new Set([...(prev.themes || []), ...items.map((e) => e.theme)]))
+      prev.raw = (prev.raw || '') + '\n' + lines
+    } else {
+      weeklyMap.set(day, {
+        day,
+        themes: items.map((e) => e.theme),
+        raw: lines,
+      })
+    }
+  }
+  mem.weekly = [...weeklyMap.values()].sort((a, b) => String(a.day).localeCompare(String(b.day)))
+  if (mem.weekly.length > WEEKLY_MAX) mem.weekly = mem.weekly.slice(-WEEKLY_MAX)
+  return sink
+}
+
+// L2 -> L3：超龄的周归纳合并成「月印象」，永不删除
+function sinkWeeklyToMonthly(mem) {
+  const weekly = mem.weekly || []
+  const now = Date.now()
+  const keep = []
+  const sink = []
+  for (const w of weekly) {
+    const age = w.day && w.day !== 'early' ? (now - new Date(w.day + 'T00:00:00').getTime()) / 86400000 : 999
+    if (age < 90) keep.push(w)
+    else sink.push(w)
+  }
+  mem.weekly = keep
+  if (!sink.length) return sink
+  const byMonth = new Map()
+  for (const w of sink) {
+    const month = w.day && w.day !== 'early' ? String(w.day).slice(0, 7) : 'early'
+    if (!byMonth.has(month)) byMonth.set(month, [])
+    byMonth.get(month).push(w)
+  }
+  const monthly = Array.isArray(mem.monthly) ? mem.monthly : []
+  const monthlyMap = new Map(monthly.map((m) => [String(m.month || ''), m]))
+  for (const [month, items] of byMonth) {
+    const themes = Array.from(new Set(items.flatMap((w) => w.themes || [])))
+    const prev = monthlyMap.get(month)
+    if (prev) {
+      prev.themes = Array.from(new Set([...(prev.themes || []), ...themes]))
+      prev.raw = (prev.raw || '') + '\n' + items.map((w) => w.raw || '').join('\n')
+    } else {
+      monthlyMap.set(month, { month, themes, raw: items.map((w) => w.raw || '').join('\n') })
+    }
+  }
+  mem.monthly = [...monthlyMap.values()].sort((a, b) => String(a.month).localeCompare(String(b.month)))
+  return sink
 }
 
 let episodeBusy = false
@@ -1235,7 +1382,8 @@ async function maybeGenerateEpisodes(ctx, threadId, messages) {
       const m2 = loadMemory()
       m2.cursor[key] = cur
       if (eps.length) m2.episodes = (m2.episodes || []).concat(eps)
-      rollSummary(m2)
+      sinkEpisodesToWeekly(m2)
+      sinkWeeklyToMonthly(m2)
       writeMemory(m2)
       chunks += 1
     }
@@ -1333,6 +1481,9 @@ async function compressEpisodes(ctx, messages, prevEps) {
       recent.map((e) => `· ${e.theme}：${e.content}`).join('\n')
   }
   const transcript = lines.join('\n')
+  const factsNote = (loadFacts().length)
+    ? '\n【已经知道的人物事实，别重复记成事件卡】\n' + loadFacts().map((f) => `${f.key}：${(f.facts || []).join('；')}`).slice(0, 20).join('\n')
+    : ''
   const userMsg = prevText
     ? `已有的记忆卡：\n${prevText}\n\n本段对话：\n${transcript}`
     : `本段对话：\n${transcript}`
@@ -1340,7 +1491,7 @@ async function compressEpisodes(ctx, messages, prevEps) {
   for await (const chunk of ctx.llm.stream({
     provider,
     model,
-    system: episodesText(),
+    system: episodesText() + '\n\n【重要】只记真实发生、值得长期记住的事件。哲学闲聊、日常调情、寒暄、情绪流水账一律不记。宁少勿滥，没有值得记的就输出空数组 []。' + factsNote,
     messages: [{ role: 'user', content: [{ type: 'text', text: userMsg }] }],
     temperature: 0.3,
     maxTokens: 2000,
@@ -1360,12 +1511,18 @@ function bigrams(s) {
 }
 
 function recallEpisodes(query, mem) {
-  const eps = mem.episodes || []
-  if (!eps.length || !query || !String(query).trim()) return []
+  if (!query || !String(query).trim()) return []
   const q = bigrams(query)
   const ql = String(query).toLowerCase()
   const scored = []
-  for (const e of eps) {
+  // L1 近期事件 + L2 周归纳 + L3 月印象，一起搜
+  const pool = [
+    ...(mem.episodes || []).map((e) => ({ kind: 'episode', e })),
+    ...(mem.weekly || []).map((w) => ({ kind: 'weekly', e: { theme: '一周：' + String(w.day || ''), content: (w.themes || []).join('、'), keywords: w.themes || [], ts: w.day ? new Date(w.day + 'T00:00:00').toISOString() : '' } })),
+    ...(mem.monthly || []).map((m) => ({ kind: 'monthly', e: { theme: '那段时间：' + String(m.month || ''), content: (m.themes || []).join('、'), keywords: m.themes || [], ts: m.month ? new Date(m.month + '-01T00:00:00').toISOString() : '' } })),
+  ]
+  for (const item of pool) {
+    const e = item.e
     const ageDays = e.ts ? Math.max(0, (Date.now() - new Date(e.ts).getTime()) / 86400000) : 365
     const decay = Math.max(0, 1 - ageDays / RECALL_DECAY_DAYS)
     // 1) 关键词命中：强信号（解决「推箱子」→「沉星之序」这类无共同字的情况）
@@ -1384,7 +1541,7 @@ function recallEpisodes(query, mem) {
       if (t.size) for (const b of q) if (t.has(b)) hit++
       if (hit > 0) score = (hit / q.size) * 0.75 + decay * 0.25
     }
-    if (score >= RECALL_THRESHOLD) scored.push({ e, score })
+    if (score >= RECALL_THRESHOLD) scored.push({ e, score, kind: item.kind })
   }
   scored.sort((a, b) => b.score - a.score)
   return scored.slice(0, RECALL_K).map((s) => s.e)
@@ -1700,11 +1857,53 @@ async function serveGet(request) {
   if (path === `${BASE}/current`) {
     const thread = loadCurrent()
     if (!thread) return jsonResponse({ empty: true })
-    const limitParam = parseInt(url.searchParams.get('limit'), 10)
-    const limit = Number.isFinite(limitParam) ? Math.max(20, Math.min(limitParam, 3000)) : 100
     const all = Array.isArray(thread.messages) ? thread.messages : []
-    const messages = all.slice(-limit)
-    return jsonResponse({ ...thread, messages, total: all.length })
+    const aroundParam = url.searchParams.get('around')
+    const aroundTs = aroundParam ? Number(aroundParam) : NaN
+    if (Number.isFinite(aroundTs) && aroundTs > 0) {
+      // 点击引用块定位：按时间戳找到原文，返回它前后一小段，让用户能看到完整上下文
+      const pad = Math.max(1, Math.min(parseInt(url.searchParams.get('pad'), 10) || 20, 100))
+      const idx = all.findIndex((m) => m && Number(m.ts) === aroundTs)
+      if (idx < 0) return jsonResponse({ empty: true, total: all.length })
+      const from = Math.max(0, idx - pad)
+      const to = Math.min(all.length, idx + pad + 1)
+      const messages = all.slice(from, to)
+      return jsonResponse({ ...thread, messages, total: all.length, offset: idx, hasMore: true })
+    }
+    const limitParam = parseInt(url.searchParams.get('limit'), 10)
+    const limit = Number.isFinite(limitParam) ? Math.max(20, Math.min(limitParam, 2000)) : 300
+    const beforeParam = url.searchParams.get('before')
+    const beforeTs = beforeParam ? Number(beforeParam) : NaN
+    // 翻页：只取「比某条更早」的记录；无时间戳的老消息视为最早，始终归入最后一批
+    const windowMsgs = Number.isFinite(beforeTs) && beforeTs > 0
+      ? all.filter((m) => !(m && m.ts) || Number(m.ts) < beforeTs)
+      : all
+    const messages = windowMsgs.slice(-limit)
+    const hasMore = windowMsgs.length > messages.length
+    return jsonResponse({ ...thread, messages, total: all.length, hasMore })
+  }
+  if (path === `${BASE}/search-history`) {
+    const q = String(url.searchParams.get('q') || '').trim().slice(0, 60)
+    if (!q) return jsonResponse({ error: 'bad q' }, 400)
+    const thread = loadCurrent()
+    if (!thread) return jsonResponse({ hits: [], total: 0 })
+    const all = Array.isArray(thread.messages) ? thread.messages : []
+    const hits = []
+    for (let i = 0; i < all.length; i++) {
+      const m = all[i]
+      if (!m || typeof m.content !== 'string') continue
+      if (!m.content.includes(q)) continue
+      // 取前后各 10 句
+      const from = Math.max(0, i - 10)
+      const to = Math.min(all.length, i + 11)
+      const context = all.slice(from, to).map((x) => ({
+        role: x && x.role === 'user' ? 'user' : 'assistant',
+        content: String(x && x.content || ''),
+        ts: x && x.ts ? x.ts : '',
+      }))
+      hits.push({ index: i, message: m.content, ts: m.ts || '', context })
+    }
+    return jsonResponse({ hits: hits.slice(0, 20), total: hits.length })
   }
   if (path === `${BASE}/threads`) {
     return jsonResponse({ threads: listThreads() })
@@ -1718,7 +1917,16 @@ async function serveGet(request) {
   if (path === `${BASE}/episodes`) {
     const mem = loadMemory()
     const eps = (mem.episodes || []).slice().reverse()
-    return jsonResponse({ episodes: eps, summary: mem.summary, count: eps.length })
+    return jsonResponse({
+      episodes: eps,
+      summary: mem.summary,
+      count: eps.length,
+      weekly: (mem.weekly || []).slice().reverse(),
+      monthly: (mem.monthly || []).slice().reverse(),
+    })
+  }
+  if (path === `${BASE}/facts`) {
+    return jsonResponse(loadFacts())
   }
   if (path === `${BASE}/memos`) {
     return jsonResponse({ memos: listMemos() })
@@ -1769,7 +1977,7 @@ export function apply(ctx) {
   ensureDirs()
   const disposers = []
   disposers.push(ctx.webServer.register({ kind: 'prefix', path: BASE, resource: serveGet }))
-  for (const name of ['chat', 'notes', 'save', 'model', 'mem-edit', 'episode-edit', 'game-move', 'game-over', 'memo', 'memo-write', 'drawing', 'draw-ai', 'chat-bg', 'xq-say', 'xq-over']) {
+  for (const name of ['chat', 'notes', 'save', 'model', 'mem-edit', 'episode-edit', 'game-move', 'game-over', 'memo', 'memo-write', 'drawing', 'draw-ai', 'chat-bg', 'xq-say', 'xq-over', 'facts']) {
     disposers.push(
       ctx.webServer.register({
         kind: 'exact',
@@ -1797,6 +2005,7 @@ async function handlePost(ctx, name, req, res) {
   if (name === 'chat-bg') return chatBgPost(req, res)
   if (name === 'xq-say') return xqSay(ctx, req, res)
   if (name === 'xq-over') return xqOver(ctx, req, res)
+  if (name === 'facts') return factsPost(req, res)
   if (name === 'notes') return notes(ctx, req, res)
   if (name === 'save') return save(ctx, req, res)
   if (name === 'model') return setModel(ctx, req, res)
@@ -1925,7 +2134,7 @@ async function save(ctx, req, res) {
   }
   try {
     const thread = saveThread(body)
-    maybeGenerateEpisodes(ctx, thread.threadId, thread.messages)
+    maybeGenerateEpisodes(ctx, thread.threadId, normRealMessages(thread.messages))
     return sendJson(res, 200, { ok: true, threadId: thread.threadId, updatedAt: thread.updatedAt })
   } catch (error) {
     return sendJson(res, 500, { error: String((error && error.message) || error).slice(0, 200) })
@@ -1945,6 +2154,12 @@ async function chat(ctx, req, res) {
   const memory = cleanNotes(body && body.notes)
   const game = body && body.game ? body.game : null
   const memo = body && body.memo ? body.memo : null
+  // 微信式引用：从最后一条用户消息的 meta.quote 提取被引用的原文
+  // 注意：引用可能是单独一条消息，附话是下一条，所以要找最近一条带 meta.quote 的 user 消息
+  const quotedMsg = [...normMessages(body && body.messages)].reverse().find((m) => m.role === 'user' && m.meta && typeof m.meta.quote === 'string')
+  const quoteText = quotedMsg && quotedMsg.meta && typeof quotedMsg.meta.quote === 'string'
+    ? quotedMsg.meta.quote.slice(0, 2000)
+    : ''
   const drawingImage = typeof body && body.drawingImage === 'string' && body.drawingImage.startsWith('data:image/') ? body.drawingImage : ''
   const full = normMessages(body && body.messages)
   const history = full.slice(-cfg.historyTurns)
@@ -1963,7 +2178,49 @@ async function chat(ctx, req, res) {
   const backStr = lastUser && (recall.length === 0 || hasQuestion)
     ? backtrackBlock(full, lastUser.content)
     : ''
-  const factsStr = factsBlock()
+  // 旧的关键词注入 + 新的 L0 词条层（含敏感词条按需展开）
+  const factsStr = factsBlock() + '\n\n' + (lastUser ? factsBlockForMessage(lastUser.content) : '')
+
+  // 微信式引用：在历史里定位被引用的句子，取该句附近少量上下文，供她自行判断需要多少
+  let quoteContextText = ''
+  if (quoteText) {
+    // 优先去服务端全量历史里定位：前端发来的只是最近几十条，引用的原文可能早已滚出窗口，
+    // 光靠 body.messages 会定位失败、退化成只有几个字，让模型理解成残缺内容。
+    let all = normMessages(body && body.messages)
+    const quoteTs = quotedMsg && quotedMsg.meta && Number(quotedMsg.meta.quoteTs)
+    const stored = loadCurrent()
+    const storedMsgs = stored && Array.isArray(stored.messages) ? normMessages(stored.messages) : []
+    if (storedMsgs.length > all.length) all = storedMsgs
+    const norm = (s) => String(s || '').replace(/\s+/g, '')
+    const target = norm(quoteText)
+    let found = false
+    if (target) {
+      // 先按时间戳精确找（引用的是哪条就是哪条，避免同文案在不同位置被误定位）
+      const tsIndex = Number.isFinite(quoteTs) && quoteTs > 0
+        ? all.findIndex((m) => Number(m && m.ts) === quoteTs)
+        : -1
+      const start = tsIndex >= 0 ? tsIndex : 0
+      const end = tsIndex >= 0 ? tsIndex + 1 : all.length
+      for (let i = start; i < end; i++) {
+        const cur = norm(all[i].content)
+        if (cur === target || (cur && cur.includes(target)) || (target && target.includes(cur))) {
+          // 上下文扩到前后各 6 句，覆盖成语接龙这类「一轮多句」的完整来龙去脉
+          const from = Math.max(0, i - 6)
+          const to = Math.min(all.length, i + 7)
+          quoteContextText = all.slice(from, to).map((m) => {
+            const role = m.role === 'user' ? '对方' : '你'
+            return `${role}：${m.content}`
+          }).join('\n')
+          found = true
+          break
+        }
+      }
+    }
+    // 定位失败也要让模型看到被引用的原文，不能假装没这回事
+    if (!found) {
+      quoteContextText = '对方引用的话：' + quoteText
+    }
+  }
 
   const { provider, model } = selection(ctx, cfg)
   const splitter = new Splitter(cfg.bubbleSoft, cfg.bubbleHard)
@@ -2017,7 +2274,8 @@ async function chat(ctx, req, res) {
           model,
           system: buildSystem(memory, recallStr, backStr, factsStr, history)
             + (gameBlock(game) ? '\n\n' + gameBlock(game) : '\n\n【关于棋局】如果对方提到下棋、复盘或这局怎么下的，你现在手上没有具体棋局面，直接说记不清或不知道，绝不许自己编造棋盘或结果。')
-            + (memoBlock(memo) ? '\n\n' + memoBlock(memo) : ''),
+            + (memoBlock(memo) ? '\n\n' + memoBlock(memo) : '')
+            + (quoteContextText ? '\n\n【对方引用了一句你们之前说过的话】\n' + quoteContextText + '\n\n请结合这段话接话，不用再翻更多，找到答案就停。' : ''),
           messages: [{ role: 'user', content: userContent }],
           temperature: cfg.temperature,
           maxTokens: cfg.maxTokens,
@@ -2465,7 +2723,7 @@ async function gameOver(ctx, req, res) {
   const gameName = kind === 'gomoku' ? '五子棋' : '井字棋'
 
   const system = promptText().replace('{memory}', memoryBlock(memory)) +
-    `\n\n你们刚下完一局${gameName}。结果是：${resultText}。\n最终棋面（「对方」=黑、「我」=白）：\n${boardDesc}\n\n现在你用你自己的口吻说一句收尾的话，自然一点，别念规则、别报结果、别总结。可以带点真实反应（赢了别太得意、输了别嘴硬、平局别硬夸）。只输出这一句话，不要引号、不要任何前缀。`
+    `\n\n你们刚刚下完了一局${gameName}。结果是：${resultText}。\n\n【你现在只能说这一局棋的收尾话】\n· 必须围绕「这局棋结束了、结果是${resultText}」来说。\n· 赢了别太得意，输了别嘴硬，平局别硬夸。\n· 禁止接之前聊天的内容，禁止谈棋局以外的事，禁止自由发挥、禁止比喻人生、禁止说无关的话。\n· 一句话，8~20 个字。只输出这一句，不要引号、不要前缀。`
 
   const recent = history.slice(-12).map((m) => {
     const role = m.role === 'user' ? '对方' : '你'
@@ -2482,7 +2740,7 @@ async function gameOver(ctx, req, res) {
       model,
       system,
       messages: [{ role: 'user', content: [{ type: 'text', text: `最近聊天：\n${recent}\n\n请说一句收尾的话。` }] }],
-      temperature: 0.8,
+      temperature: 0.5,
       maxTokens: 80,
       reasoningEffort: 'low',
       signal: abort.signal,
@@ -2504,7 +2762,7 @@ async function notes(ctx, req, res) {
     return sendJson(res, 400, { error: 'bad json' })
   }
   const memory = cleanNotes(body && body.notes)
-  const history = normMessages(body && body.messages).slice(-40)
+  const history = normRealMessages(body && body.messages).slice(-40)
 
   if (history.length < 2) return sendJson(res, 200, { notes: memory, updated: false })
 

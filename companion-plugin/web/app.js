@@ -146,6 +146,13 @@
   function avatarState(state) {
     window.dispatchEvent(new CustomEvent('companion-avatar', { detail: { state } }));
   }
+  // 游戏心声：只显示气泡（可选朗读），不写入聊天历史，避免污染记忆/事件卡
+  function gameSay(text, withTts) {
+    if (!text) return;
+    if (withTts) prefetchTts(text);
+    const bubbleEl = addBubble('assistant', text);
+    if (withTts) enqueueTts(text, bubbleEl);
+  }
 
   // ---------- 下棋：井字棋 + 五子棋 ----------
   // 棋盘用 canvas 渲染（五子棋 15×15 用 DOM 格子会卡），落子决策来自后端 game-move（小喵本人）。
@@ -435,11 +442,7 @@
       if (!r.ok) return;
       const d = await r.json();
       if (d && d.say) {
-        prefetchTts(d.say);
-        const bubbleEl = addBubble('assistant', d.say);
-        enqueueTts(d.say, bubbleEl);
-        S.history.push({ role: 'assistant', content: d.say, ts: Date.now() });
-        scheduleSave(200);
+        gameSay(d.say, true);
       }
     } catch {}
   }
@@ -469,9 +472,7 @@
         applyResult();
         saveGame();
         if (d.say) {
-          addBubble('assistant', d.say);
-          S.history.push({ role: 'assistant', content: d.say, ts: Date.now() });
-          scheduleSave(200);
+          gameSay(d.say, false);
         }
       }
       if (G.over) announceResult();
@@ -488,10 +489,12 @@
     const gameShell = $('game-shell');
     const memoShell = $('memo-shell');
     const drawShell = $('draw-shell');
+    const xiangqiShell = $('xiangqi-shell');
     if (avatarShell) avatarShell.hidden = mode !== 'avatar';
     if (gameShell) gameShell.hidden = mode !== 'game' && mode !== 'gomoku';
     if (memoShell) memoShell.hidden = mode !== 'memo';
     if (drawShell) drawShell.hidden = mode !== 'draw';
+    if (xiangqiShell) xiangqiShell.hidden = mode !== 'xiangqi';
     if (mode === 'avatar') return;
     if (mode === 'memo') {
       localStorage.setItem('companion.panelMode.v1', mode);
@@ -501,6 +504,11 @@
     if (mode === 'draw') {
       localStorage.setItem('companion.panelMode.v1', mode);
       loadDraw();
+      return;
+    }
+    if (mode === 'xiangqi') {
+      localStorage.setItem('companion.panelMode.v1', mode);
+      xqEnsure();
       return;
     }
     const kind = mode === 'gomoku' ? 'gomoku' : 'tictactoe';
@@ -533,13 +541,16 @@
     });
   });
   // 默认井字棋（形象已隐藏）
-  const savedMode = ['gomoku', 'memo', 'draw'].includes(localStorage.getItem('companion.panelMode.v1'))
+  const savedMode = ['gomoku', 'memo', 'draw', 'xiangqi'].includes(localStorage.getItem('companion.panelMode.v1'))
     ? localStorage.getItem('companion.panelMode.v1')
     : 'game';
   localStorage.setItem('companion.panelMode.v1', savedMode);
-  document.querySelectorAll('.mode-tab').forEach((t) => {
-    if (t.dataset.mode === savedMode) t.click();
-  });
+  // 延迟恢复默认模式：等所有模块（尤其象棋的 XQ）初始化完毕，避免 TDZ 报错
+  setTimeout(() => {
+    document.querySelectorAll('.mode-tab').forEach((t) => {
+      if (t.dataset.mode === savedMode) t.click();
+    });
+  }, 0);
 
   // ---------- 便签纸 ----------
   // 第一步：纯文字便签，可新建/编辑/删除，服务端自动保存，电脑手机同步。
@@ -1164,6 +1175,590 @@
     send();
   });
 
+
+  // ---------- 中国象棋 ----------
+  // 引擎用现成的 WUKONG（MIT），她只负责把 AI 的下一步意图说成人话。
+  const XQ_KEY = 'companion.xq.v1';
+  const XQ = {
+    id: 'xq-main',
+    board: [],
+    side: 0,          // 0=红(你), 1=黑(她)
+    over: false,
+    winner: '',
+    busy: false,
+    selected: -1,
+    legalMoves: [],
+    engine: null,
+    aiSide: 1,
+    depth: 1,
+    lastMove: -1,
+    startFen: '',
+  };
+  const xqBoardEl = $('xiangqi-board');
+  const xqStatusEl = $('xiangqi-status');
+
+  function initXq() {
+    if (XQ.engine) return;
+    try {
+      if (typeof Engine === 'function') {
+        XQ.engine = new Engine();
+        // 引擎构造后不会自动摆初始局面，需要显式设置
+        XQ.engine.setBoard(XQ.engine.START_FEN);
+        XQ.startFen = XQ.engine.START_FEN;
+      }
+    } catch (e) { console.error('[xq] 引擎初始化失败', e); }
+  }
+  function xqPieceAt(sq) {
+    if (!XQ.engine) return 0;
+    return XQ.engine.getPiece(sq);
+  }
+  // 把 mailbox square index 转成 UI 行/列（红方在底部）
+  // COORDINATES: a9 在 rank2, a0 在 rank12；我们 UI 行 0=黑方顶(a9)，行 9=红方底(a0)
+  function xqSquareToRC(sq) {
+    if (!XQ.engine) return null;
+    const coord = XQ.engine.squareToString(sq);
+    const m = coord.match(/^([a-i])(\d)$/);
+    if (!m) return null;
+    const file = m[1].charCodeAt(0) - 'a'.charCodeAt(0);
+    const rank = 9 - Number(m[2]);  // rank 9 -> 行0(黑顶)，rank 0 -> 行9(红底)
+    return { r: rank, c: file, sq };
+  }
+  function xqRCToSquare(r, c) {
+    if (!XQ.engine) return -1;
+    const rank = 9 - r;
+    const file = String.fromCharCode('a'.charCodeAt(0) + c);
+    return XQ.engine.moveFromString(file + rank + file + rank); // 占位，用 squareToString 反查
+  }
+  // 引擎没有直接 squareFromString 的公开接口，用遍历 getPiece 对应
+  function xqFindSquareByRC(r, c) {
+    if (!XQ.engine) return -1;
+    const rank = 9 - r;
+    const file = String.fromCharCode('a'.charCodeAt(0) + c);
+    for (let sq = 0; sq < 154; sq++) {
+      if (XQ.engine.squareToString(sq) === file + rank) return sq;
+    }
+    return -1;
+  }
+  function xqLoadBoard() {
+    if (!XQ.engine) return;
+    XQ.board = [];
+    for (let sq = 0; sq < 154; sq++) {
+      const coord = XQ.engine.squareToString(sq);
+      if (coord && coord !== 'xx') XQ.board.push({ sq, coord, piece: XQ.engine.getPiece(sq) });
+    }
+  }
+  function xqRender() {
+    if (!xqBoardEl) return;
+    const pieceNames = {
+      1: '兵', 2: '仕', 3: '相', 4: '傌', 5: '炮', 6: '俥', 7: '帥',
+      8: '卒', 9: '士', 10: '象', 11: '馬', 12: '砲', 13: '車', 14: '將',
+    };
+    let cv = xqBoardEl.querySelector('canvas');
+    if (!cv) {
+      cv = document.createElement('canvas');
+      cv.className = 'xiangqi-canvas';
+      xqBoardEl.appendChild(cv);
+      cv.addEventListener('click', xqClickFromEvent);
+    }
+    const W = 900, H = 960;
+    cv.width = W;
+    cv.height = H;
+    const ctx = cv.getContext('2d');
+    const padX = 60, padY = 60;
+    const stepX = (W - padX * 2) / 8;
+    const stepY = (H - padY * 2) / 9;
+    // 背景
+    ctx.fillStyle = '#f4e9d3';
+    ctx.fillRect(0, 0, W, H);
+    // 棋盘线
+    ctx.strokeStyle = '#8a6a42';
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    // 横线
+    for (let r = 0; r < 10; r++) {
+      const y = padY + r * stepY;
+      ctx.beginPath();
+      ctx.moveTo(padX, y);
+      ctx.lineTo(W - padX, y);
+      ctx.stroke();
+    }
+    // 竖线：上下两半中间断开（楚河汉界）
+    for (let c = 0; c < 9; c++) {
+      const x = padX + c * stepX;
+      ctx.beginPath();
+      ctx.moveTo(x, padY);
+      ctx.lineTo(x, padY + 4 * stepY);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x, padY + 5 * stepY);
+      ctx.lineTo(x, H - padY);
+      ctx.stroke();
+    }
+    // 两条边竖线贯通
+    ctx.beginPath();
+    ctx.moveTo(padX, padY); ctx.lineTo(padX, H - padY); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(W - padX, padY); ctx.lineTo(W - padX, H - padY); ctx.stroke();
+    // 九宫格斜线
+    const gx = [padX + 3 * stepX, padX + 5 * stepX];
+    const gyTop = [padY, padY + 2 * stepY];
+    const gyBot = [H - padY - 2 * stepY, H - padY];
+    for (const [a, b] of [[0, 1], [1, 0]]) {
+      ctx.beginPath();
+      ctx.moveTo(gx[0], gyTop[a]); ctx.lineTo(gx[1], gyTop[b]); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(gx[0], gyBot[a]); ctx.lineTo(gx[1], gyBot[b]); ctx.stroke();
+    }
+    // 炮/兵位标记
+    const marks = [
+      [1, 2], [7, 2], [1, 7], [7, 7],
+      [0, 3], [2, 3], [4, 3], [6, 3], [8, 3],
+      [0, 6], [2, 6], [4, 6], [6, 6], [8, 6],
+    ];
+    ctx.fillStyle = '#8a6a42';
+    for (const [c, r] of marks) {
+      const x = padX + c * stepX;
+      const y = padY + r * stepY;
+      const d = 5;
+      if (c === 0 || c === 8) {
+        ctx.beginPath();
+        ctx.moveTo(x - 8, y - 8); ctx.lineTo(x - 2, y - 2); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x + 8, y - 8); ctx.lineTo(x + 2, y - 2); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x - 8, y + 8); ctx.lineTo(x - 2, y + 2); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x + 8, y + 8); ctx.lineTo(x + 2, y + 2); ctx.stroke();
+      } else {
+        ctx.beginPath();
+        ctx.moveTo(x - 8, y - 8); ctx.lineTo(x - 2, y - 2); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x + 8, y - 8); ctx.lineTo(x + 2, y - 2); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x - 8, y + 8); ctx.lineTo(x - 2, y + 2); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x + 8, y + 8); ctx.lineTo(x + 2, y + 2); ctx.stroke();
+      }
+    }
+    // 楚河汉界文字
+    ctx.fillStyle = '#8a6a42';
+    ctx.font = 'bold 28px "KaiTi", "STKaiti", "Microsoft YaHei", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('楚  河', W * 0.27, padY + 4.5 * stepY);
+    ctx.fillText('汉  界', W * 0.73, padY + 4.5 * stepY);
+    // 棋子：画在交叉点上
+    const pieceColors = { red: '#b4443c', black: '#333' };
+    const threatened = new Set(xqThreatenedSquares());
+    for (let r = 0; r < 10; r++) {
+      for (let c = 0; c < 9; c++) {
+        const sq = xqFindSquareByRC(r, c);
+        const piece = XQ.engine ? XQ.engine.getPiece(sq) : 0;
+        if (!piece || !pieceNames[piece]) continue;
+        const x = padX + c * stepX;
+        const y = padY + r * stepY;
+        const radius = Math.min(stepX, stepY) * 0.42;
+        // 合法落点提示
+        if (XQ.legalMoves.includes(sq)) {
+          ctx.fillStyle = 'rgba(124, 191, 85, 0.45)';
+          ctx.beginPath(); ctx.arc(x, y, radius + 4, 0, Math.PI * 2); ctx.fill();
+        }
+        // 棋子本体
+        ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2);
+        ctx.fillStyle = '#fff9ef';
+        ctx.fill();
+        ctx.strokeStyle = '#b89a68';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.fillStyle = piece < 8 ? pieceColors.red : pieceColors.black;
+        ctx.font = 'bold 50px "KaiTi", "STKaiti", "Microsoft YaHei", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(pieceNames[piece], x, y + 1);
+        // 她下一步能直接吃掉的你的子：标红
+        if (threatened.has(sq)) {
+          ctx.strokeStyle = '#e04a3a';
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          ctx.arc(x, y, radius + 5, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+        // 最新一步的棋子加一圈标识
+        if (XQ.lastMove === sq) {
+          ctx.strokeStyle = '#07c160';
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          ctx.arc(x, y, radius + 5, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+        // 选中高亮：最后画，最醒目
+        if (XQ.selected === sq) {
+          ctx.fillStyle = 'rgba(255, 214, 74, 0.38)';
+          ctx.beginPath(); ctx.arc(x, y, radius + 8, 0, Math.PI * 2); ctx.fill();
+        }
+      }
+    }
+    if (XQ.over) {
+      if (XQ.winner === 'user') xqStatusEl.textContent = '你赢啦';
+      else if (XQ.winner === 'assistant') xqStatusEl.textContent = '她赢啦';
+      else xqStatusEl.textContent = '和棋';
+    } else {
+      xqStatusEl.textContent = XQ.engine && XQ.engine.getSide() === XQ.aiSide ? '她在想…' : '轮到你';
+    }
+  }
+  function xqClickFromEvent(e) {
+    const cv = e.currentTarget;
+    const rect = cv.getBoundingClientRect();
+    const x = (e.clientX - rect.left) * (cv.width / rect.width);
+    const y = (e.clientY - rect.top) * (cv.height / rect.height);
+    const padX = 60, padY = 60;
+    const stepX = (cv.width - padX * 2) / 8;
+    const stepY = (cv.height - padY * 2) / 9;
+    const c = Math.round((x - padX) / stepX);
+    const r = Math.round((y - padY) / stepY);
+    if (r < 0 || r > 9 || c < 0 || c > 8) return;
+    const sq = xqFindSquareByRC(r, c);
+    if (sq >= 0) xqCellClick(sq);
+  }
+  function xqCellClick(sq) {
+    if (!XQ.engine || XQ.over || XQ.busy) return;
+    const side = XQ.engine.getSide();
+    if (side !== 0) return; // 只允许用户走红方
+    const piece = XQ.engine.getPiece(sq);
+    // 点另一个己方棋子：直接切换选中
+    if (piece >= 1 && piece <= 7 && sq !== XQ.selected) {
+      XQ.selected = sq;
+      const moves = XQ.engine.generateLegalMoves();
+      XQ.legalMoves = moves.filter((m) => XQ.engine.getSourceSquare(m.move) === sq).map((m) => XQ.engine.getTargetSquare(m.move));
+      xqRender();
+      return;
+    }
+    if (XQ.selected === -1) {
+      // 点的是空位或对方子且没有选中：忽略
+      return;
+    } else {
+      const moves = XQ.engine.generateLegalMoves();
+      const move = moves.find((m) => XQ.engine.getSourceSquare(m.move) === XQ.selected && XQ.engine.getTargetSquare(m.move) === sq);
+      if (move) {
+        // 吃子提示
+        const capturedPiece = XQ.engine.getPiece(sq);
+        const capturedName = capturedPiece ? xqPieceName(capturedPiece) : '';
+        XQ.engine.makeMove(move.move);
+        XQ.lastMove = sq;
+        XQ.selected = -1;
+        XQ.legalMoves = [];
+        xqSave();
+        xqRender();
+        if (capturedName) {
+          xqStatusEl.textContent = '你吃了她的' + capturedName;
+          xqUserCaptureSay(capturedName);
+        }
+        // 你将军她（黑方 BLACK=1 被将军）：让她说一句
+        if (XQ.engine.inCheck(1) === 1) {
+          xqUserCheckSay();
+        }
+        xqCheckOver();
+        if (!XQ.over) xqAiTurn();
+      } else {
+        XQ.selected = -1;
+        XQ.legalMoves = [];
+        xqRender();
+      }
+    }
+  }
+  async function xqAiTurn() {
+    if (!XQ.engine || XQ.over) return;
+    XQ.busy = true;
+    xqStatusEl.textContent = '她在想…';
+    try {
+      // 给人「她在犹豫」的节奏：落子前停顿
+      await new Promise((r) => setTimeout(r, 1000 + Math.random() * 900));
+      if (XQ.over) { XQ.busy = false; return; }
+      // 引擎计算下一步
+      const move = XQ.engine.search(XQ.depth);
+      if (move == null) { XQ.busy = false; return; }
+      const from = XQ.engine.getSourceSquare(move);
+      const to = XQ.engine.getTargetSquare(move);
+      const moveStr = XQ.engine.moveToString(move);
+      // 她走的这个子的名字
+      const movingPiece = XQ.engine.getPiece(from);
+      const movingName = movingPiece ? xqPieceName(movingPiece) : '';
+      // 执行前读目标格：是否有被吃的子
+      const capturedPiece = XQ.engine.getPiece(to);
+      const capturedName = capturedPiece ? xqPieceName(capturedPiece) : '';
+      // 行为和话语一起放出
+      XQ.engine.makeMove(move);
+      XQ.lastMove = to;
+      // 走子后检测她是否将军你（红方 RED=0 被将军）
+      const check = XQ.engine.inCheck(0) === 1;
+      // 让语言模型解释这一步（若将军则明确说将军）
+      const boardDesc = xqDescribeBoard();
+      const say = await xqFetchSay(boardDesc, moveStr, check, capturedName);
+      xqCheckOver();
+      xqSave();
+      xqRender();
+      // 普通走子说「动一下XX」；吃子/将军用她生成的话
+      const normalSay = movingName
+        ? ['我动一下' + movingName + '。', '先走走我的' + movingName + '。', movingName + '往那边挪一下。'][Math.floor(Math.random() * 3)]
+        : '';
+      const finalSay = say || normalSay;
+      if (finalSay) {
+        gameSay(finalSay, false);
+      }
+    } catch (e) {
+      console.error('[xq] AI 走子失败', e);
+    } finally {
+      XQ.busy = false;
+    }
+  }
+  function xqDescribeBoard() {
+    const pieceNames = {
+      1: '兵', 2: '仕', 3: '相', 4: '傌', 5: '炮', 6: '俥', 7: '帥',
+      8: '卒', 9: '士', 10: '象', 11: '馬', 12: '砲', 13: '車', 14: '將',
+    };
+    const lines = [];
+    for (let r = 0; r < 10; r++) {
+      const row = [];
+      for (let c = 0; c < 9; c++) {
+        const sq = xqFindSquareByRC(r, c);
+        const p = XQ.engine.getPiece(sq);
+        row.push(p ? (p < 8 ? '红' : '黑') + pieceNames[p] : '·');
+      }
+      lines.push(row.join(' '));
+    }
+    return lines.join('\n');
+  }
+  function xqPieceName(piece) {
+    const pieceNames = {
+      1: '兵', 2: '仕', 3: '相', 4: '傌', 5: '炮', 6: '俥', 7: '帥',
+      8: '卒', 9: '士', 10: '象', 11: '馬', 12: '砲', 13: '車', 14: '將',
+    };
+    return pieceNames[piece] || '';
+  }
+  // 轮到你时：找出她下一步能直接吃掉的你的红子（黑方着法目标格是红子）
+  function xqThreatenedSquares() {
+    if (!XQ.engine || XQ.over) return [];
+    const side = XQ.engine.getSide();
+    if (side !== 0) return []; // 只在轮到你（红方）时提示
+    // 引擎的 generateLegalMoves 只生成当前方；临时切到黑方来拿黑方着法
+    const savedFen = xqExportFen();
+    if (!savedFen) return [];
+    const savedMoves = XQ.engine.getMoves().join(' ');
+    const blackFen = savedFen.replace(/ (\w) - - 0 1$/, ' b - - 0 1');
+    XQ.engine.setBoard(blackFen);
+    const moves = XQ.engine.generateLegalMoves();
+    const threatened = new Set();
+    for (const m of moves) {
+      const target = XQ.engine.getTargetSquare(m.move);
+      const piece = XQ.engine.getPiece(target);
+      if (piece >= 1 && piece <= 7) threatened.add(target);
+    }
+    // 恢复红方局面
+    XQ.engine.setBoard(XQ.startFen || XQ.engine.START_FEN);
+    if (savedMoves) XQ.engine.loadMoves(savedMoves);
+    return [...threatened];
+  }
+  async function xqFetchSay(boardDesc, moveStr, check, capturedName) {
+    try {
+      const r = await fetch(BASE + '/xq-say', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          board: boardDesc,
+          move: moveStr,
+          check: !!check,
+          captured: capturedName || '',
+          notes: S.notes,
+          messages: S.history.slice(-S.limit),
+        }),
+      });
+      if (!r.ok) return '';
+      const d = await r.json();
+      return d && d.say ? d.say : '';
+    } catch { return ''; }
+  }
+  // 你将军她：她反应过来自己被将军
+  async function xqUserCheckSay() {
+    try {
+      const r = await fetch(BASE + '/xq-say', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          board: xqDescribeBoard(),
+          move: '',
+          check: 'self',
+          notes: S.notes,
+          messages: S.history.slice(-S.limit),
+        }),
+      });
+      if (!r.ok) return;
+      const d = await r.json();
+      if (d && d.say) {
+        gameSay(d.say, false);
+      }
+    } catch {}
+  }
+  // 你吃了她的子：她反应过来
+  async function xqUserCaptureSay(capturedName) {
+    try {
+      const r = await fetch(BASE + '/xq-say', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          board: xqDescribeBoard(),
+          move: '',
+          check: '',
+          captured: 'self:' + capturedName,
+          notes: S.notes,
+          messages: S.history.slice(-S.limit),
+        }),
+      });
+      if (!r.ok) return;
+      const d = await r.json();
+      if (d && d.say) {
+        gameSay(d.say, false);
+      }
+    } catch {}
+  }
+  function xqCheckOver() {
+    if (!XQ.engine) return;
+    // 简化判定：无合法着法即输
+    const moves = XQ.engine.generateLegalMoves();
+    if (!moves.length) {
+      XQ.over = true;
+      XQ.winner = XQ.engine.getSide() === XQ.aiSide ? 'user' : 'assistant';
+      xqAnnounceResult();
+    }
+  }
+  // 终局结算：像五子棋一样朗读一句收尾
+  async function xqAnnounceResult() {
+    if (!XQ.over) return;
+    try {
+      const r = await fetch(BASE + '/xq-over', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          winner: XQ.winner,
+          notes: S.notes,
+          messages: S.history.slice(-S.limit),
+        }),
+      });
+      if (!r.ok) return;
+      const d = await r.json();
+      if (d && d.say) {
+        gameSay(d.say, true);
+      }
+    } catch {}
+  }
+  // 把当前局面导出成 FEN（适配层实现，引擎只支持导入）
+  function xqExportFen() {
+    if (!XQ.engine) return '';
+    const PIECE_TO_CHAR = ['.', 'P', 'A', 'B', 'N', 'C', 'R', 'K', 'p', 'a', 'b', 'n', 'c', 'r', 'k'];
+    const rows = [];
+    for (let r = 0; r < 10; r++) {
+      let row = '';
+      let empty = 0;
+      for (let c = 0; c < 9; c++) {
+        const sq = xqFindSquareByRC(r, c);
+        const p = XQ.engine.getPiece(sq);
+        if (p && PIECE_TO_CHAR[p] && PIECE_TO_CHAR[p] !== '.') {
+          if (empty) { row += String(empty); empty = 0; }
+          row += PIECE_TO_CHAR[p];
+        } else {
+          empty++;
+        }
+      }
+      if (empty) row += String(empty);
+      rows.push(row);
+    }
+    const side = XQ.engine.getSide() === 0 ? 'w' : 'b';
+    return rows.join('/') + ' ' + side + ' - - 0 1';
+  }
+  function xqSave() {
+    try {
+      const fen = xqExportFen();
+      if (!fen) return;
+      write(XQ_KEY, { fen, over: XQ.over, winner: XQ.winner });
+    } catch {}
+  }
+  function xqLoad() {
+    try {
+      const saved = read(XQ_KEY, null);
+      if (saved && typeof saved.fen === 'string' && saved.fen) {
+        XQ.engine.setBoard(saved.fen);
+        XQ.startFen = saved.fen;
+        XQ.over = !!saved.over;
+        XQ.winner = saved.winner || '';
+      } else {
+        XQ.engine.setBoard(XQ.engine.START_FEN);
+        XQ.startFen = XQ.engine.START_FEN;
+        XQ.over = false;
+        XQ.winner = '';
+      }
+      XQ.selected = -1;
+      XQ.legalMoves = [];
+      XQ.lastMove = -1;
+      xqRender();
+    } catch {}
+  }
+  function xqNew() {
+    initXq();
+    if (!XQ.engine) return;
+    XQ.engine.setBoard(XQ.engine.START_FEN);
+    XQ.startFen = XQ.engine.START_FEN;
+    XQ.over = false;
+    XQ.winner = '';
+    XQ.selected = -1;
+    XQ.legalMoves = [];
+    XQ.lastMove = -1;
+    xqSave();
+    xqRender();
+  }
+  async function xqAiFirst() {
+    xqNew();
+    await xqAiTurn();
+  }
+  // 悔棋：撤销她的一步和你的上一步，回到轮到你
+  function xqUndo() {
+    console.log('[xq] 悔棋点击: engine=', !!XQ.engine, 'over=', XQ.over, 'busy=', XQ.busy);
+    if (!XQ.engine || XQ.busy) {
+      if (xqStatusEl) xqStatusEl.textContent = '等她想完';
+      return;
+    }
+    const stack = XQ.engine.moveStack();
+    console.log('[xq] moveStack 长度:', Array.isArray(stack) ? stack.length : typeof stack);
+    if (!Array.isArray(stack) || !stack.length) {
+      if (xqStatusEl) xqStatusEl.textContent = '没有可悔的步';
+      return;
+    }
+    // 撤销最后两步（她的 + 你的）；若只有一步（让她先手后的局面），撤一步
+    const steps = Math.min(2, stack.length);
+    for (let i = 0; i < steps; i++) {
+      XQ.engine.takeBack();
+    }
+    XQ.selected = -1;
+    XQ.legalMoves = [];
+    XQ.lastMove = -1;
+    XQ.over = false;
+    XQ.winner = '';
+    xqSave();
+    xqRender();
+  }
+  // 绑定
+  const xqNewBtn = $('xiangqi-new');
+  if (xqNewBtn) xqNewBtn.addEventListener('click', xqNew);
+  const xqUndoBtn = $('xiangqi-undo');
+  if (xqUndoBtn) xqUndoBtn.addEventListener('click', xqUndo);
+  const xqAiFirstBtn = $('xiangqi-ai-first');
+  if (xqAiFirstBtn) xqAiFirstBtn.addEventListener('click', xqAiFirst);
+  // 切到象棋 tab 时初始化
+  function xqEnsure() {
+    initXq();
+    if (XQ.engine) {
+      xqLoad();
+    }
+  }
+
   let ttsAudio = null;
   let playingEl = null;
   let playEndCb = null;
@@ -1691,8 +2286,10 @@
     try {
       // 只发最近 S.limit 条（后端 historyTurns 也按这个数切），省上行带宽、更快拿到首字节
       const payload = { notes: S.notes, messages: S.history.slice(-S.limit) };
-      // 无论棋局是否结束，都带上当前棋局面，让她能如实回顾，而不是凭印象瞎编
-      payload.game = currentGame();
+      // 只在棋局进行中、且当前正开着棋类侧栏时才带上棋局，避免她凭空催人下棋
+      const activeMode = localStorage.getItem('companion.panelMode.v1') || 'game';
+      const gomokuOrTic = activeMode === 'game' || activeMode === 'gomoku';
+      if (gomokuOrTic && !G.over) payload.game = currentGame();
       // 带上当前便签内容，让她能看到纸上写了什么
       const memoText = memoEditorEl ? memoEditorEl.value.trim() : '';
       // 只要有当前便签（哪怕空白纸），就发给她，让她知道有这张纸
@@ -2131,6 +2728,13 @@
       const d = await (await fetch(BASE + '/episodes')).json();
       const items = d.episodes || [];
       box.innerHTML = '';
+      // 更早的事件卡会并入滚动摘要：在顶部显示出来，不让记忆「消失」
+      if (d.summary) {
+        const sum = document.createElement('div');
+        sum.className = 'episode-summary';
+        sum.textContent = '更早：' + d.summary;
+        box.appendChild(sum);
+      }
       if (!items.length) {
         box.innerHTML = '<p class="mem-empty">还没有事件卡，多聊几句就有了。</p>';
         return;

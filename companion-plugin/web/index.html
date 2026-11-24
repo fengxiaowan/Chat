@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>闲聊</title>
-<link rel="stylesheet" href="/liao/style.css?v=20261123ttsdebug">
+<link rel="stylesheet" href="/liao/style.css?v=20261124memfix">
 </head>
 <body>
 <div class="companion-layout" id="companion-layout">
@@ -12,6 +12,7 @@
     <nav class="mode-tabs">
       <button class="mode-tab active" data-mode="game" title="井字棋">♟ 井字棋</button>
       <button class="mode-tab" data-mode="gomoku" title="五子棋">⚄ 五子棋</button>
+      <button class="mode-tab" data-mode="xiangqi" title="中国象棋">🏮 中国象棋</button>
       <button class="mode-tab" data-mode="memo" title="便签">📝 便签</button>
       <button class="mode-tab" data-mode="draw" title="画板">🖍 画板</button>
       <button class="mode-tab" data-mode="avatar" title="形象" hidden>ฅ 形象</button>
@@ -19,7 +20,7 @@
     </nav>
 
     <section id="avatar-shell" class="avatar-shell" aria-label="虚拟形象" hidden>
-<img id="avatar-poster" class="avatar-poster" src="/liao/assets/avatar/Alicia-preview.png?v=20261123ttsdebug" alt="Alicia 虚拟形象预览">
+<img id="avatar-poster" class="avatar-poster" src="/liao/assets/avatar/Alicia-preview.png?v=20261124memfix" alt="Alicia 虚拟形象预览">
       <canvas id="avatar-canvas"></canvas>
       <div class="avatar-badge">
         <span>Alicia</span>
@@ -36,6 +37,19 @@
       <div class="game-actions">
         <button id="game-new" class="game-btn" title="新一局">新一局</button>
         <button id="game-ai-first" class="game-btn" title="让她先手">让她先手</button>
+      </div>
+    </section>
+
+    <section id="xiangqi-shell" class="xiangqi-shell" aria-label="中国象棋" hidden>
+      <div class="game-head">
+        <span class="game-title">中国象棋</span>
+        <span id="xiangqi-status" class="game-status">轮到你</span>
+      </div>
+      <div class="board" id="xiangqi-board"></div>
+      <div class="game-actions">
+        <button id="xiangqi-new" class="game-btn" title="新一局">新一局</button>
+        <button id="xiangqi-ai-first" class="game-btn" title="让她先手">让她先手</button>
+        <button id="xiangqi-undo" class="game-btn xq-undo" title="悔棋">悔棋</button>
       </div>
     </section>
 
@@ -173,7 +187,8 @@
   </div>
 </aside>
 
-<script src="/liao/app.js?v=20261123ttsdebug"></script>
+<script src="/liao/vendor/wukong.js?v=20261124memfix"></script>
+<script src="/liao/app.js?v=20261124memfix"></script>
 <script>
   // 华为浏览器切回时可能回收页面进程；缓存页面壳，恢复后先把本地对话画出来。
   if ('serviceWorker' in navigator) {

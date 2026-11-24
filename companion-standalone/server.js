@@ -3,15 +3,20 @@
 // 原理：插件只依赖三个 DSH 服务（webServer.register / llm.stream / agentDefaultModel），
 // 这里用一个很小的"模拟环境"实现它们，然后把插件的 apply() 原样跑起来。
 import http from 'node:http'
-import { readFileSync } from 'node:fs'
+import { readFileSync, existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { apply as applyPlugin } from '../companion-plugin/index.js'
 
 const CONFIG_PATH = fileURLToPath(new URL('./config.json', import.meta.url))
+const LOCAL_CONFIG_PATH = fileURLToPath(new URL('./config.local.json', import.meta.url))
 const config = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
+// 敏感配置（密钥）放在被 gitignore 的 config.local.json，公开配置留 config.json
+const localConfig = existsSync(LOCAL_CONFIG_PATH)
+  ? JSON.parse(readFileSync(LOCAL_CONFIG_PATH, 'utf8'))
+  : {}
 
 const BASE_URL = String(config.baseUrl || '').replace(/\/+$/, '')
-const API_KEY = String(config.apiKey || '')
+const API_KEY = String(localConfig.apiKey || config.apiKey || '')
 const CHAT_MODEL = config.chatModel || 'deepseek-v4-pro'
 const EXTRACT_MODEL = config.extractModel || 'deepseek-v4-flash'
 const PORT = Number(config.port || 8788)

@@ -626,6 +626,124 @@ async function chatBgPost(req, res) {
   return sendJson(res, 200, { ok: true, hash })
 }
 
+// 中国象棋：她解释 AI 的下一步，行为和话语一起放
+async function xqSay(ctx, req, res) {
+  let body
+  try {
+    body = await readJson(req)
+  } catch {
+    return sendJson(res, 400, { error: 'bad json' })
+  }
+  const board = String(body && body.board || '').slice(0, 4000)
+  const move = String(body && body.move || '').slice(0, 40)
+  const check = body && body.check
+  const captured = String(body && body.captured || '').slice(0, 12)
+  if (!board) return sendJson(res, 400, { error: 'bad params' })
+
+  // 只在有确定事件（吃子/将军）时才让她开口，避免自由棋评瞎说
+  const isCapturedSelf = captured && captured.startsWith('self:')
+  const isCapturedOther = captured && !isCapturedSelf
+  const isCheckSelf = check === 'self'
+  const isCheckOther = check === true
+  if (!isCapturedSelf && !isCapturedOther && !isCheckSelf && !isCheckOther) {
+    return sendJson(res, 200, { say: '' })
+  }
+
+  const cfg = tune()
+  const memory = cleanNotes(body && body.notes)
+  const history = normMessages(body && body.messages).slice(-cfg.historyTurns)
+  const { provider, model } = selection(ctx, cfg)
+
+  let event = ''
+  if (isCheckSelf) event = '你刚刚被对方将军了（你的黑方王被将）'
+  else if (isCheckOther) event = '你这一步将军了对方（红方的王被将）'
+  else if (isCapturedSelf) event = `你的一个${captured.slice(5)}被对方吃掉了`
+  else if (isCapturedOther) event = `你这一步吃掉了对方的一个${captured}`
+
+  const system = promptText().replace('{memory}', memoryBlock(memory)) +
+    `\n\n你和朋友正在下中国象棋，你执黑，对方执红。刚才这一步发生了一件事：${event}。\n\n你只用你自己的口吻说一句简短的话（8~15 个字）回应这件事。禁止谈别的、禁止点评棋局、禁止编造棋谱和局势。\n\n只输出这一句话，不要引号、不要任何前缀。`
+
+  const recent = history.slice(-12).map((m) => {
+    const role = m.role === 'user' ? '对方' : '你'
+    return `${role}：${m.content}`
+  }).join('\n')
+
+  const abort = new AbortController()
+  req.on('close', () => abort.abort())
+
+  try {
+    let text = ''
+    for await (const chunk of ctx.llm.stream({
+      provider,
+      model,
+      system,
+      messages: [{ role: 'user', content: [{ type: 'text', text: `最近聊天：\n${recent}\n\n刚才这件事是：${event}。说一句简短回应。` }] }],
+      temperature: 0.7,
+      maxTokens: 80,
+      reasoningEffort: 'low',
+      signal: abort.signal,
+    })) {
+      if (isText(chunk)) text += chunk.text
+    }
+    const say = text.replace(/^["'「」\s]+|["'「」\s]+$/g, '').trim().slice(0, 60)
+    return sendJson(res, 200, { say })
+  } catch (error) {
+    return sendJson(res, 500, { error: String((error && error.message) || error).slice(0, 160) })
+  }
+}
+
+// 中国象棋终局结算：她用一句话总结结果
+async function xqOver(ctx, req, res) {
+  let body
+  try {
+    body = await readJson(req)
+  } catch {
+    return sendJson(res, 400, { error: 'bad json' })
+  }
+  const winner = ['user', 'assistant', 'draw'].includes(body && body.winner) ? body.winner : 'draw'
+  const cfg = tune()
+  const memory = cleanNotes(body && body.notes)
+  const history = normMessages(body && body.messages).slice(-cfg.historyTurns)
+  const { provider, model } = selection(ctx, cfg)
+
+  const resultText = winner === 'user'
+    ? '你输了，对方赢了'
+    : winner === 'assistant'
+      ? '你赢了，对方输了'
+      : '和棋'
+
+  const system = promptText().replace('{memory}', memoryBlock(memory)) +
+    `\n\n你们刚下完一局中国象棋。结果是：${resultText}。\n\n你用你自己的口吻说一句收尾的话，自然一点，别念规则、别报结果、别总结。赢了别太得意，输了别嘴硬。\n\n只输出这一句话，不要引号、不要任何前缀。`
+
+  const recent = history.slice(-12).map((m) => {
+    const role = m.role === 'user' ? '对方' : '你'
+    return `${role}：${m.content}`
+  }).join('\n')
+
+  const abort = new AbortController()
+  req.on('close', () => abort.abort())
+
+  try {
+    let text = ''
+    for await (const chunk of ctx.llm.stream({
+      provider,
+      model,
+      system,
+      messages: [{ role: 'user', content: [{ type: 'text', text: `最近聊天：\n${recent}\n\n请说一句收尾的话。` }] }],
+      temperature: 0.8,
+      maxTokens: 80,
+      reasoningEffort: 'low',
+      signal: abort.signal,
+    })) {
+      if (isText(chunk)) text += chunk.text
+    }
+    const say = text.replace(/^["'「」\s]+|["'「」\s]+$/g, '').trim().slice(0, 60)
+    return sendJson(res, 200, { say })
+  } catch (error) {
+    return sendJson(res, 500, { error: String((error && error.message) || error).slice(0, 160) })
+  }
+}
+
 function normMessages(list) {
   return (Array.isArray(list) ? list : [])
     .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
@@ -1539,6 +1657,7 @@ const ASSETS = {
   [`${BASE}/vendor/three-vrm.module.js`]: ['vendor/three-vrm.module.js', 'application/javascript; charset=utf-8'],
   [`${BASE}/vendor/GLTFLoader.js`]: ['vendor/GLTFLoader.js', 'application/javascript; charset=utf-8'],
   [`${BASE}/vendor/utils/BufferGeometryUtils.js`]: ['vendor/utils/BufferGeometryUtils.js', 'application/javascript; charset=utf-8'],
+  [`${BASE}/vendor/wukong.js`]: ['vendor/wukong.js', 'application/javascript; charset=utf-8'],
   [`${BASE}/assets/avatar/AliciaSolid.vrm`]: ['assets/avatar/AliciaSolid.vrm', 'model/gltf-binary'],
   [`${BASE}/assets/avatar/Alicia-preview.png`]: ['assets/avatar/Alicia-preview.png', 'image/png'],
 }
@@ -1650,7 +1769,7 @@ export function apply(ctx) {
   ensureDirs()
   const disposers = []
   disposers.push(ctx.webServer.register({ kind: 'prefix', path: BASE, resource: serveGet }))
-  for (const name of ['chat', 'notes', 'save', 'model', 'mem-edit', 'episode-edit', 'game-move', 'game-over', 'memo', 'memo-write', 'drawing', 'draw-ai', 'chat-bg']) {
+  for (const name of ['chat', 'notes', 'save', 'model', 'mem-edit', 'episode-edit', 'game-move', 'game-over', 'memo', 'memo-write', 'drawing', 'draw-ai', 'chat-bg', 'xq-say', 'xq-over']) {
     disposers.push(
       ctx.webServer.register({
         kind: 'exact',
@@ -1676,6 +1795,8 @@ async function handlePost(ctx, name, req, res) {
   if (name === 'drawing') return drawingPost(req, res)
   if (name === 'draw-ai') return drawAi(ctx, req, res)
   if (name === 'chat-bg') return chatBgPost(req, res)
+  if (name === 'xq-say') return xqSay(ctx, req, res)
+  if (name === 'xq-over') return xqOver(ctx, req, res)
   if (name === 'notes') return notes(ctx, req, res)
   if (name === 'save') return save(ctx, req, res)
   if (name === 'model') return setModel(ctx, req, res)

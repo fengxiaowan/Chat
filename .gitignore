@@ -1,5 +1,7 @@
-# 运行数据与日志（含私密对话记录）
-companion-plugin/data/
+# 运行数据：文本型记忆随 git 备份，图片/语音/运行时文件不传
+companion-plugin/data/images/
+companion-plugin/data/tts/
+companion-plugin/data/prompt.md
 companion-proxy/logs/
 *.log
 
@@ -12,3 +14,4 @@ __pycache__/
 .env.*
 *.pem
 *.key
+companion-standalone/config.local.json

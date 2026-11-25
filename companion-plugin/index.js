@@ -139,10 +139,14 @@ function checkAuth(headers) {
   } catch { return false }
 }
 
-const UNAUTH_RES = new Response('Unauthorized', {
-  status: 401,
-  headers: { 'WWW-Authenticate': 'Basic realm="companion"', 'content-type': 'text/plain; charset=utf-8' },
-})
+// Response 的 body 只能被读一次：401 必须每次新建。
+// 复用同一个对象时，第二次未鉴权请求会拿到已锁定的流（standalone 端报 ReadableStream is locked）。
+function unauthResponse() {
+  return new Response('Unauthorized', {
+    status: 401,
+    headers: { 'WWW-Authenticate': 'Basic realm="companion"', 'content-type': 'text/plain; charset=utf-8' },
+  })
+}
 
 function episodesText() {
   try { return read('episodes.md') } catch { return FALLBACK_EPISODES }
@@ -1889,6 +1893,7 @@ function isNetworkGlitch(message) {
 // 给用户看的报错文案：绝不把 "fetch failed" 这种原文亮出来，太破坏沉浸感。
 function friendlyError(message) {
   const s = String(message || '')
+  if (/empty-completion/.test(s)) return '刚才那下没接上话，你再说一句？'
   if (isNetworkGlitch(s)) return '刚才网络抖了一下没接上话，你再说一遍好啦'
   if (isBusyError(s)) return '她那边有点挤，稍等一下再发一次'
   return s.slice(0, 300)
@@ -2005,7 +2010,7 @@ async function serveGet(request) {
   const url = new URL(request.url)
   const path = url.pathname.replace(/\/+$/, '') || BASE
   const asset = ASSETS[path]
-  if (!checkAuth(request.headers) && !asset) return UNAUTH_RES
+  if (!checkAuth(request.headers) && !asset) return unauthResponse()
 
   if (path === BASE) {
     return new Response(read('index.html'), {
@@ -2496,6 +2501,7 @@ async function chat(ctx, req, res) {
   try {
     let attempt = 0
     let netAttempts = 0
+    let emptyAttempts = 0
     for (;;) {
       attempt += 1
       try {
@@ -2528,16 +2534,26 @@ async function chat(ctx, req, res) {
         }
         for (const b of splitter.flush()) emit(b)
         if (tail) sse(res, { type: 'bubble', text: tail })
+        // 官方接口偶发返回「finish=stop 但 content 为空」的空回复（实测约一半概率）。
+        // 这时下面没有气泡可发，前端只会收到 thinking 和 done，表现成「正在输入消失后什么都没发生」。
+        // 所以空回复当异常处理，走重试；重试也空才报错，绝不让它静默结束。
+        if (count === 0) throw new Error('empty-completion')
         break
       } catch (error) {
         const msg = String((error && error.message) || error)
-        // 并发被占满 / 网络抖动：还没出过气泡时都原地重试，别把原始报错撒给用户。
-        const retryable = count === 0 && (isBusyError(msg) || isNetworkGlitch(msg))
-        if (!stalled && retryable && (isBusyError(msg) ? attempt < MAX_BUSY_ATTEMPTS : netAttempts < 3)) {
+        // 并发被占满 / 网络抖动 / 空回复：还没出过气泡时都原地重试，别把原始报错撒给用户。
+        const isEmpty = msg === 'empty-completion'
+        const retryable = count === 0 && (isBusyError(msg) || isNetworkGlitch(msg) || isEmpty)
+        if (!stalled && retryable && (isBusyError(msg) ? attempt < MAX_BUSY_ATTEMPTS : isEmpty ? emptyAttempts < 2 : netAttempts < 3)) {
           if (isBusyError(msg)) {
             const waitMs = BUSY_BASE_MS * attempt
             sse(res, { type: 'wait', ms: waitMs, text: '她那边有点挤，我排一下队…' })
             await sleep(waitMs)
+          } else if (isEmpty) {
+            // 空回复既不是网络问题也不是额度问题，重问一次通常就有内容，不打扰用户
+            emptyAttempts += 1
+            console.log(`[chat] 空回复，重试 ${emptyAttempts}/2`)
+            await sleep(600 * emptyAttempts)
           } else {
             netAttempts += 1
             const waitMs = 1500 * netAttempts

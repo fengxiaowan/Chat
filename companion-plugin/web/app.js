@@ -2331,6 +2331,7 @@
     let got = 0;
     let timedOut = false;
     let idleTimer = null;
+    let shownError = false;
     // 服务端每 2 秒会发心跳；但手机走蜂窝/Tailscale 时抖动大、心跳可能被缓冲推迟，
     // 所以「静默」判定放宽到 90 秒（和后端 stall 一致），只要收到过任意字节就重置。
     const timeoutMs = 90000;
@@ -2407,7 +2408,7 @@
             }
             else if (evt.type === 'thinking') { if (!S.typing) showTyping(); armIdle(); }
             else if (evt.type === 'wait') { setTypingLabel(evt.text || '她那边有点挤，我排一下队…'); armIdle(); }
-            else if (evt.type === 'error') { showError(evt.message, !!evt.quota); }
+            else if (evt.type === 'error') { shownError = true; showError(evt.message, !!evt.quota); }
             else if (evt.type === 'info') {
               if (evt.limit) S.limit = evt.limit;
               if (evt.imgs && evt.imgs.length) {
@@ -2426,6 +2427,7 @@
           markOffline();
           pendingResend = () => { if (gen === S.gen) runTurn(text, isRetry, images); };
         } else {
+          shownError = true;
           showError('连不上：' + e.message);
         }
       }
@@ -2444,6 +2446,10 @@
           } else {
             addBubble('assistant', '好像还是没接上，你等会儿再说一句？');
           }
+        } else if (got === 0 && !shownError) {
+          // 兜底：本轮一个气泡都没收到、也没报过错（比如服务端空回复后静默收尾），
+          // 绝不能就这么把「正在输入」收掉完事——那对用户就是「踩空」。
+          addBubble('assistant', '刚才那下没接上话，你再说一句？');
         }
       }
       if (got > 0 && gen === S.gen) {

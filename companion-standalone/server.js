@@ -3,7 +3,7 @@
 // 原理：插件只依赖三个 DSH 服务（webServer.register / llm.stream / agentDefaultModel），
 // 这里用一个很小的"模拟环境"实现它们，然后把插件的 apply() 原样跑起来。
 import http from 'node:http'
-import { readFileSync, existsSync } from 'node:fs'
+import { readFileSync, existsSync, appendFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { apply as applyPlugin } from '../companion-plugin/index.js'
 
@@ -20,6 +20,11 @@ const API_KEY = String(localConfig.apiKey || config.apiKey || '')
 const CHAT_MODEL = config.chatModel || 'deepseek-v4-pro'
 const EXTRACT_MODEL = config.extractModel || 'deepseek-v4-flash'
 const PORT = Number(config.port || 8788)
+const LOG_PATH = fileURLToPath(new URL('./server.log', import.meta.url))
+// 出错留痕：以前进程是 wscript 静默拉起的，报错全丢，出问题只能猜。
+function logLine(tag, text) {
+  try { appendFileSync(LOG_PATH, `[${new Date().toISOString()}] ${tag} ${String(text).slice(0, 400).replace(/\s+/g, ' ')}\n`) } catch {}
+}
 
 // 把插件的 DSH 模型名映射到中转的模型名
 function mapModel(model) {
@@ -57,23 +62,33 @@ async function* relayStream(options) {
     stream: true,
   }
 
-  const res = await fetch(`${BASE_URL}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${API_KEY}`,
-    },
-    body: JSON.stringify(body),
-    signal: options && options.signal,
-  })
+  let res
+  try {
+    res = await fetch(`${BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${API_KEY}`,
+      },
+      body: JSON.stringify(body),
+      signal: options && options.signal,
+    })
+  } catch (error) {
+    logLine('relay-fail', (error && error.message) || error)
+    throw error
+  }
 
   if (!res.ok || !res.body) {
     const text = await res.text().catch(() => '')
+    logLine('relay-status', `${res.status} ${text}`)
     const quotaHit = isQuotaError(res.status, text)
     const err = new Error(`relay ${res.status}: ${text.slice(0, 300)}`)
     if (quotaHit) err.quota = true
     throw err
   }
+
+  let sawText = false
+  let finishReason = null
 
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
@@ -89,14 +104,20 @@ async function* relayStream(options) {
       if (!line.startsWith('data:')) continue
       const data = line.slice(5).trim()
       if (!data || data === '[DONE]') {
-        if (data === '[DONE]') return
+        if (data === '[DONE]') {
+          if (!sawText) logLine('relay-empty', `model=${body.model} finish=${finishReason}`)
+          return
+        }
         continue
       }
       let json
       try { json = JSON.parse(data) } catch { continue }
-      const delta = json.choices && json.choices[0] && json.choices[0].delta
+      const choice = json.choices && json.choices[0]
+      const delta = choice && choice.delta
+      if (choice && choice.finish_reason) finishReason = choice.finish_reason
       if (!delta) continue
       if (typeof delta.content === 'string' && delta.content) {
+        sawText = true
         yield { type: 'text-delta', text: delta.content }
       }
       const reasoning = delta.reasoning_content || delta.reasoning
@@ -105,6 +126,7 @@ async function* relayStream(options) {
       }
     }
   }
+  if (!sawText) logLine('relay-empty', `model=${body.model} finish=${finishReason}`)
 }
 
 // ---------- 模拟 webServer ----------
@@ -190,6 +212,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(405)
     res.end()
   } catch (error) {
+    logLine('http-500', `${req.method} ${req.url} :: ${(error && error.message) || error}`)
     if (!res.headersSent) {
       res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' })
     }

@@ -29,7 +29,8 @@ function logLine(tag, text) {
 // 把插件的 DSH 模型名映射到中转的模型名
 function mapModel(model) {
   const m = String(model || '')
-  if (/flash/i.test(m)) return EXTRACT_MODEL
+  // relay 只认 deepseek-v4-flash；旧配置可能误写成 deepseek-flash，这里兜底纠正
+  if (/flash/i.test(m)) return /v4/.test(EXTRACT_MODEL) ? EXTRACT_MODEL : 'deepseek-v4-flash'
   if (/pro/i.test(m)) return CHAT_MODEL
   return m || CHAT_MODEL
 }

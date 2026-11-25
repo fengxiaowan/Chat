@@ -835,6 +835,12 @@ footer {
 
 .episode-actions { margin-top: 6px; text-align: right; }
 .episode .mem-edit-input { display: block; width: 100%; box-sizing: border-box; margin-top: 4px; }
+.episode textarea.archive-raw {
+  width: 100%; box-sizing: border-box; margin-top: 4px;
+  font: inherit; font-size: 13px; line-height: 1.5;
+  resize: vertical; padding: 6px 8px;
+  border: 1px solid #ccc; border-radius: 4px;
+}
 
 @media (max-width: 760px) {
   body { display: block; }

@@ -2351,7 +2351,9 @@
       // 只在棋局进行中、且当前正开着棋类侧栏时才带上棋局，避免她凭空催人下棋
       const activeMode = localStorage.getItem('companion.panelMode.v1') || 'game';
       const gomokuOrTic = activeMode === 'game' || activeMode === 'gomoku';
-      if (gomokuOrTic && !G.over) payload.game = currentGame();
+      // 空棋盘不算「正在下棋」：只有棋盘上真有落子才带棋局，否则她会每轮都被
+      // 系统提示「正在下棋、轮到对方」，聊着聊着就催人下棋。
+      if (gomokuOrTic && !G.over && G.board.some((c) => c)) payload.game = currentGame();
       // 带上当前便签内容，让她能看到纸上写了什么
       const memoText = memoEditorEl ? memoEditorEl.value.trim() : '';
       // 只要有当前便签（哪怕空白纸），就发给她，让她知道有这张纸
@@ -2882,7 +2884,7 @@
       const d = await (await fetch(BASE + '/episodes')).json();
       const items = d.episodes || [];
       box.innerHTML = '';
-      // 周归纳和月印象：展示古早记忆的沉降结果
+      // 周归纳和月印象：展示古早记忆的沉降结果，并支持就地编辑
       const monthly = Array.isArray(d.monthly) ? d.monthly : [];
       const weekly = Array.isArray(d.weekly) ? d.weekly : [];
       if (monthly.length) {
@@ -2891,24 +2893,7 @@
         h.textContent = '月印象';
         box.appendChild(h);
         for (const m of monthly) {
-          const div = document.createElement('div');
-          div.className = 'episode episode-archive';
-          if (Array.isArray(m.summary) && m.summary.length) {
-            div.innerHTML = '';
-            const monthEl = document.createElement('div');
-            monthEl.className = 'episode-theme';
-            monthEl.textContent = m.month || '';
-            div.appendChild(monthEl);
-            for (const s of m.summary) {
-              const line = document.createElement('div');
-              line.className = 'episode-content';
-              line.textContent = `${s.theme}：${s.content}`;
-              div.appendChild(line);
-            }
-          } else {
-            div.textContent = (m.month || '') + '：' + (m.themes || []).join('、');
-          }
-          box.appendChild(div);
+          box.appendChild(makeArchiveDiv(m, 'monthly'));
         }
       }
       if (weekly.length) {
@@ -2917,24 +2902,7 @@
         h.textContent = '周归纳';
         box.appendChild(h);
         for (const w of weekly) {
-          const div = document.createElement('div');
-          div.className = 'episode episode-archive';
-          if (Array.isArray(w.summary) && w.summary.length) {
-            div.innerHTML = '';
-            const dayEl = document.createElement('div');
-            dayEl.className = 'episode-theme';
-            dayEl.textContent = w.day || '';
-            div.appendChild(dayEl);
-            for (const s of w.summary) {
-              const line = document.createElement('div');
-              line.className = 'episode-content';
-              line.textContent = `${s.theme}：${s.content}`;
-              div.appendChild(line);
-            }
-          } else {
-            div.textContent = (w.day || '') + '：' + (w.themes || []).join('、');
-          }
-          box.appendChild(div);
+          box.appendChild(makeArchiveDiv(w, 'weekly'));
         }
       }
       if (!items.length) {
@@ -2981,6 +2949,111 @@
       }
     } catch {
       box.innerHTML = '<p class="mem-empty">读取失败。</p>';
+    }
+  }
+
+  // 渲染一条周归纳 / 月印象（带改、删按钮）
+  function makeArchiveDiv(item, kind) {
+    const div = document.createElement('div');
+    div.className = 'episode episode-archive';
+    const key = kind === 'weekly' ? (item.day || '') : (item.month || '');
+    const label = key || '(未标注日期)';
+    const head = document.createElement('div');
+    head.className = 'episode-theme';
+    head.textContent = label;
+    div.appendChild(head);
+    const body = document.createElement('div');
+    body.className = 'episode-content';
+    const raw = item.raw || '';
+    if (raw) {
+      body.textContent = raw.length > 400 ? raw.slice(0, 400) + '…' : raw;
+      body.title = raw;
+    } else {
+      body.textContent = (item.themes || []).join('、');
+    }
+    div.appendChild(body);
+    const actions = document.createElement('div');
+    actions.className = 'episode-actions';
+    const edit = document.createElement('button');
+    edit.type = 'button';
+    edit.className = 'mini';
+    edit.textContent = '改';
+    edit.title = '编辑这段归纳';
+    edit.addEventListener('click', () => archiveInlineEdit(div, item, kind));
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'mini';
+    del.textContent = '删';
+    del.title = '删除这段归纳';
+    del.addEventListener('click', async () => {
+      if (!confirm('删掉这段归纳？')) return;
+      await archiveEdit(kind, key, 'delete');
+      renderEpisodes();
+    });
+    actions.appendChild(edit);
+    actions.appendChild(del);
+    div.appendChild(actions);
+    return div;
+  }
+
+  // 归纳就地编辑：日期标签 + 完整文本
+  function archiveInlineEdit(div, item, kind) {
+    const keyField = kind === 'weekly' ? 'day' : 'month';
+    const key = item[keyField] || '';
+    const raw = item.raw || '';
+    const labelIn = document.createElement('input');
+    labelIn.type = 'text';
+    labelIn.value = key;
+    labelIn.className = 'mem-edit-input';
+    labelIn.placeholder = kind === 'weekly' ? '日期 YYYY-MM-DD' : '月份 YYYY-MM';
+    const rawIn = document.createElement('textarea');
+    rawIn.value = raw;
+    rawIn.className = 'mem-edit-input archive-raw';
+    rawIn.rows = 12;
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'mini';
+    save.textContent = '存';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'mini';
+    cancel.textContent = '取消';
+    const actions = document.createElement('div');
+    actions.className = 'episode-actions';
+    actions.appendChild(save);
+    actions.appendChild(cancel);
+    div.innerHTML = '';
+    div.appendChild(labelIn);
+    div.appendChild(rawIn);
+    div.appendChild(actions);
+    labelIn.focus();
+    let done = false;
+    const finish = () => { if (!done) { done = true; renderEpisodes(); } };
+    save.addEventListener('click', async () => {
+      const fields = { raw: rawIn.value };
+      fields[keyField] = labelIn.value.trim();
+      await archiveEdit(kind, key, 'edit', fields);
+      finish();
+    });
+    cancel.addEventListener('click', finish);
+    [labelIn, rawIn].forEach((el) => {
+      el.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Escape') finish();
+      });
+    });
+  }
+
+  async function archiveEdit(kind, key, action, fields) {
+    try {
+      const r = await fetch(BASE + '/archive-edit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind, key, action, ...(fields || {}) }),
+      });
+      const d = await r.json();
+      if (!r.ok) alert((d && d.error) || '操作失败');
+    } catch {
+      alert('操作失败');
     }
   }
 

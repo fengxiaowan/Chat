@@ -1326,7 +1326,7 @@ function stateBlock(st) {
   return '【你现在心里有数的状态】\n' + lines.join('\n')
 }
 
-function parseEpisodes(text) {
+function parseEpisodes(text, refTs) {
   let t = String(text || '').trim()
   if (t.startsWith('```')) t = t.replace(/^```[a-zA-Z]*\s*/, '').replace(/\s*```$/, '')
   const i = t.indexOf('[')
@@ -1336,11 +1336,13 @@ function parseEpisodes(text) {
   try { arr = JSON.parse(t.slice(i, j + 1)) } catch { return [] }
   if (!Array.isArray(arr)) return []
   const now = Date.now()
+  // 事件卡 ts 用消息真实时间而不是生成时刻，避免沉降按「生成日期」错位
+  const baseTs = refTs ? new Date(refTs).getTime() : now
   return arr
     .filter((e) => e && typeof e === 'object')
     .map((e, k) => ({
       id: 'e-' + now + '-' + k + '-' + Math.random().toString(36).slice(2, 6),
-      ts: new Date().toISOString(),
+      ts: new Date(baseTs).toISOString(),
       theme: String(e.theme || '').trim().slice(0, 24),
       content: String(e.content || '').trim().slice(0, 60),
       mood: String(e.mood || '').trim().slice(0, 12),
@@ -1359,13 +1361,18 @@ function parseEpisodes(text) {
 function sinkEpisodesToWeekly(mem) {
   const eps = mem.episodes || []
   const now = Date.now()
-  const keep = []
+  const recent = []
   const sink = []
   for (const e of eps) {
     const age = e.ts ? (now - new Date(e.ts).getTime()) / 86400000 : 0
-    if (keep.length < MAX_EPISODES && age < EPISODE_SINK_DAYS) keep.push(e)
-    else sink.push(e)
+    // 先按年龄分开：超龄的必沉降；近期的按时间排序，只保留最新的 MAX_EPISODES 条
+    if (age >= EPISODE_SINK_DAYS) sink.push(e)
+    else recent.push(e)
   }
+  recent.sort((a, b) => String(a.ts || '').localeCompare(String(b.ts || '')))
+  const overflow = recent.length > MAX_EPISODES ? recent.slice(0, recent.length - MAX_EPISODES) : []
+  sink.push(...overflow)
+  const keep = recent.slice(-MAX_EPISODES)
   mem.episodes = keep
   if (!sink.length) return sink
   // 按天分组（没有 ts 的归到最早）
@@ -1562,7 +1569,7 @@ async function compressEpisodes(ctx, messages, prevEps) {
   for await (const chunk of ctx.llm.stream({
     provider,
     model,
-    system: episodesText() + '\n\n【重要】只记值得长期记住的事。对方的想法、创意、构想也要记，但必须用 status 标成 idea（只是构想）或 plan（说要做）；真做过的标 done。哲学闲聊、日常调情、寒暄、情绪流水账一律不记。宁少勿滥，没有值得记的就输出空数组 []。' + factsNote,
+    system: episodesText() + '\n\n【重要】只记值得长期记住的事。对方的想法、创意、构想也要记，但必须用 status 标成 idea（只是构想）或 plan（说要做）；真做过的标 done。棋局对局过程（落子、吃子、走棋步骤、单局胜负）一律不记。哲学闲聊、日常调情、寒暄、情绪流水账一律不记。宁少勿滥，没有值得记的就输出空数组 []。' + factsNote,
     messages: [{ role: 'user', content: [{ type: 'text', text: userMsg }] }],
     temperature: 0.3,
     maxTokens: 2000,
@@ -1571,7 +1578,11 @@ async function compressEpisodes(ctx, messages, prevEps) {
     if (isText(chunk)) text += chunk.text
   }
   if (!text.trim()) throw new Error('episode stream empty')
-  return parseEpisodes(text)
+  // 用这段对话里最后一条消息的真实时间作为事件卡时间，而不是压缩发生的时刻
+  const refTs = messages.length
+    ? (messages[messages.length - 1].ts || messages[0].ts || Date.now())
+    : Date.now()
+  return parseEpisodes(text, refTs)
 }
 
 function bigrams(s) {
@@ -1589,8 +1600,9 @@ function recallEpisodes(query, mem) {
   // L1 近期事件 + L2 周归纳 + L3 月印象，一起搜
   const pool = [
     ...(mem.episodes || []).map((e) => ({ kind: 'episode', e })),
-    ...(mem.weekly || []).map((w) => ({ kind: 'weekly', e: { theme: '一周：' + String(w.day || ''), content: (w.themes || []).join('、'), keywords: w.themes || [], ts: w.day ? new Date(w.day + 'T00:00:00').toISOString() : '' } })),
-    ...(mem.monthly || []).map((m) => ({ kind: 'monthly', e: { theme: '那段时间：' + String(m.month || ''), content: (m.themes || []).join('、'), keywords: m.themes || [], ts: m.month ? new Date(m.month + '-01T00:00:00').toISOString() : '' } })),
+    // 沉降层的完整细节存在 raw 里，唤起时用它而不是只剩标题，别把细节丢掉
+    ...(mem.weekly || []).map((w) => ({ kind: 'weekly', e: { theme: '一周：' + String(w.day || ''), content: String(w.raw || (w.themes || []).join('、')).slice(0, 300), keywords: w.themes || [], ts: w.day ? new Date(w.day + 'T00:00:00').toISOString() : '' } })),
+    ...(mem.monthly || []).map((m) => ({ kind: 'monthly', e: { theme: '那段时间：' + String(m.month || ''), content: String(m.raw || (m.themes || []).join('、')).slice(0, 300), keywords: m.themes || [], ts: m.month ? new Date(m.month + '-01T00:00:00').toISOString() : '' } })),
   ]
   for (const item of pool) {
     const e = item.e
@@ -2164,7 +2176,7 @@ export function apply(ctx) {
   ensureDirs()
   const disposers = []
   disposers.push(ctx.webServer.register({ kind: 'prefix', path: BASE, resource: serveGet }))
-  for (const name of ['chat', 'notes', 'save', 'model', 'mem-edit', 'episode-edit', 'game-move', 'game-over', 'memo', 'memo-write', 'drawing', 'draw-ai', 'chat-bg', 'xq-say', 'xq-over', 'facts']) {
+  for (const name of ['chat', 'notes', 'save', 'model', 'mem-edit', 'episode-edit', 'archive-edit', 'game-move', 'game-over', 'memo', 'memo-write', 'drawing', 'draw-ai', 'chat-bg', 'xq-say', 'xq-over', 'facts']) {
     disposers.push(
       ctx.webServer.register({
         kind: 'exact',
@@ -2198,6 +2210,7 @@ async function handlePost(ctx, name, req, res) {
   if (name === 'model') return setModel(ctx, req, res)
   if (name === 'mem-edit') return memEdit(ctx, req, res)
   if (name === 'episode-edit') return episodeEdit(ctx, req, res)
+  if (name === 'archive-edit') return archiveEdit(req, res)
 }
 
 // ---------- 切换模型 ----------
@@ -2310,6 +2323,56 @@ async function episodeEdit(ctx, req, res) {
   }
 }
 
+// ---------- 周归纳 / 月印象 编辑 ----------
+// 沉降层的 raw 是完整细节，但 day/month 可能因为补提时间戳而错位。
+// 给用户一个可改入口：改日期标签 + 改原始文本，themes 从 raw 自动重提。
+async function archiveEdit(req, res) {
+  let body
+  try {
+    body = await readJson(req)
+  } catch {
+    return sendJson(res, 400, { error: 'bad json' })
+  }
+  const kind = String(body && body.kind || '')
+  const action = String(body && body.action || '')
+  if (!['weekly', 'monthly'].includes(kind) || !['edit', 'delete'].includes(action)) {
+    return sendJson(res, 400, { error: 'bad params' })
+  }
+  const key = String(body && body.key || '').trim()
+  if (!key) return sendJson(res, 400, { error: 'bad key' })
+  try {
+    const mem = loadMemory()
+    const arr = kind === 'weekly' ? (mem.weekly || []) : (mem.monthly || [])
+    const idx = arr.findIndex((x) => x && String(x[kind === 'weekly' ? 'day' : 'month']) === key)
+    if (idx < 0) return sendJson(res, 404, { error: 'not found' })
+    if (action === 'delete') {
+      arr.splice(idx, 1)
+    } else {
+      const e = arr[idx]
+      if (kind === 'weekly') {
+        if (body && body.day != null) e.day = String(body.day).trim().slice(0, 10)
+        if (body && body.raw != null) {
+          e.raw = String(body.raw).slice(0, 200000)
+          // 每行「主题：内容」的冒号前部分是 theme，从改后的 raw 重提
+          e.themes = e.raw.split('\n').map((l) => l.split('：')[0].trim()).filter(Boolean)
+        }
+      } else {
+        if (body && body.month != null) e.month = String(body.month).trim().slice(0, 7)
+        if (body && body.raw != null) {
+          e.raw = String(body.raw).slice(0, 200000)
+          e.themes = e.raw.split('\n').map((l) => l.split('：')[0].trim()).filter(Boolean)
+        }
+      }
+    }
+    if (kind === 'weekly') mem.weekly = arr
+    else mem.monthly = arr
+    writeMemory(mem)
+    return sendJson(res, 200, { ok: true })
+  } catch (error) {
+    return sendJson(res, 500, { error: String((error && error.message) || error).slice(0, 160) })
+  }
+}
+
 // ---------- 保存 ----------
 
 async function save(ctx, req, res) {
@@ -2321,7 +2384,11 @@ async function save(ctx, req, res) {
   }
   try {
     const thread = saveThread(body)
-    maybeGenerateEpisodes(ctx, thread.threadId, normRealMessages(thread.messages))
+    // 关键：不能用 normRealMessages（内部 slice(-4000)）——cursor 是全局索引，
+    // 消息超过 4000 条后会被截断，messages.length - cursor 变成负数，事件卡从此停摆。
+    // 这里传完整消息，只过滤掉游戏心声，不截断。
+    const epiMsgs = (thread.messages || []).filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && !(m.meta && m.meta.game))
+    maybeGenerateEpisodes(ctx, thread.threadId, epiMsgs)
     return sendJson(res, 200, { ok: true, threadId: thread.threadId, updatedAt: thread.updatedAt })
   } catch (error) {
     return sendJson(res, 500, { error: String((error && error.message) || error).slice(0, 200) })
@@ -2738,6 +2805,8 @@ function gameBlock(game) {
     const b = Array.isArray(game.board) ? game.board : []
     const size = Number(game.size) || 15
     if (b.length !== size * size) return ''
+    // 空棋盘不算「正在下棋」，不注入，避免她凭空催人下棋
+    if (!b.some((x) => x)) return ''
     const over = !!game.over
     const winner = game.winner === 'user' ? '对方' : game.winner === 'assistant' ? '我' : game.winner === 'draw' ? '平局' : ''
     if (over) {
@@ -2749,6 +2818,7 @@ function gameBlock(game) {
   if (!game || game.kind !== 'tictactoe') return ''
   const b = Array.isArray(game.board) ? game.board : []
   if (b.length !== 9) return ''
+  if (!b.some((x) => x)) return ''
   const over = !!game.over
   const winner = game.winner === 'user' ? '对方' : game.winner === 'assistant' ? '我' : game.winner === 'draw' ? '平局' : ''
   if (over) {

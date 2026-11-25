@@ -26,6 +26,7 @@ const MEMORY_URL = new URL('./memory/', DATA_URL)
 const EPISODES_URL = new URL('episodes.json', MEMORY_URL)
 const STATE_URL = new URL('state.json', MEMORY_URL)
 const FACTS_URL = new URL('facts.json', MEMORY_URL)
+const DIGEST_URL = new URL('digest.json', MEMORY_URL)
 const IMAGES_URL = new URL('./images/', DATA_URL)
 const TTS_URL = new URL('./tts/', DATA_URL)
 const MEMOS_URL = new URL('./memos/', DATA_URL)
@@ -1148,6 +1149,72 @@ function writeMemory(mem) {
   writeJsonUrl(EPISODES_URL, mem)
 }
 
+// ---------- 归纳层：把散落的事件卡/原文整理成一段连贯记忆 ----------
+// 这是「搜索 → 整理 → 内化」的关键一步。事件卡是碎片，模型需要先把它们读成
+// 一段「这件事到底是什么」，之后才能像真记得一样自然地说出来。
+// 按主题词缓存：第一次整理烧一次额度，之后同主题直接读缓存，不再重复调用。
+
+function loadDigest() {
+  const d = readJsonUrl(DIGEST_URL, null)
+  if (d && typeof d === 'object' && d.items) return d.items
+  return {}
+}
+
+function writeDigest(items) {
+  try { mkdirSync(MEMORY_URL, { recursive: true }) } catch {}
+  writeJsonUrl(DIGEST_URL, { items, updatedAt: new Date().toISOString() })
+}
+
+// 生成主题键：用用户当前这句话里最具体的实体词（不足则退化为整句哈希）
+function digestKey(query, terms) {
+  const t = Array.isArray(terms) ? terms.filter((x) => x && x.length >= 2) : []
+  if (t.length) return t.slice(0, 3).join('+')
+  const s = String(query || '').replace(/\s+/g, '').slice(0, 24)
+  return s || 'general'
+}
+
+// 把检索到的事件卡和原文片段，整理成「角色自己能说出口」的一段记忆。
+// 不写时间线、不写「某年某月」，只提炼「这件事是什么、为什么对她重要」。
+async function digestRecall(ctx, query, recall, backText) {
+  if (!ctx || !ctx.llm) return ''
+  const cards = (Array.isArray(recall) ? recall : []).map((e) => {
+    const tag = e.status === 'idea' ? '构想' : e.status === 'plan' ? '说过要做' : '发生过的'
+    return `· [${tag}] ${e.theme}：${e.content}`
+  })
+  const parts = []
+  if (cards.length) parts.push('相关记忆卡：\n' + cards.join('\n'))
+  if (backText) parts.push('相关原文片段：\n' + backText)
+  if (!parts.length) return ''
+
+  const sys = `你是一个聊天角色的记忆整理员。下面是从聊天记录里搜出来的碎片，你需要把它们读成一两句连贯的话，变成「自己确实记得」的口气。
+
+要求：
+- 用第一人称「我」回忆，说清这件事/这个东西是什么、跟对方什么关系。
+- 不要把多条碎片一条条罗列，要合成一个整体的理解。
+- 不要编造碎片里没有的新事实；碎片有出入就拿最可信的那条。
+- 只输出这段记忆本身，不要前缀、不要「我记得」开头也可以，直接说。150 字以内。`
+
+  const userText = parts.join('\n\n')
+  let text = ''
+  try {
+    const { provider, model } = extractSelection(tune())
+    for await (const chunk of ctx.llm.stream({
+      provider,
+      model,
+      system: sys,
+      messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+      temperature: 0.4,
+      maxTokens: 300,
+      reasoningEffort: 'low',
+    })) {
+      if (isText(chunk)) text += chunk.text
+    }
+  } catch {
+    return ''
+  }
+  return text.replace(/\s+/g, ' ').trim().slice(0, 300)
+}
+
 // ---------- L0 人物事实层：永久词条，永不删 ----------
 
 function loadFacts() {
@@ -1491,7 +1558,7 @@ async function compressEpisodes(ctx, messages, prevEps) {
   for await (const chunk of ctx.llm.stream({
     provider,
     model,
-    system: episodesText() + '\n\n【重要】只记真实发生、值得长期记住的事件。哲学闲聊、日常调情、寒暄、情绪流水账一律不记。宁少勿滥，没有值得记的就输出空数组 []。' + factsNote,
+    system: episodesText() + '\n\n【重要】只记值得长期记住的事。对方的想法、创意、构想也要记，但必须用 status 标成 idea（只是构想）或 plan（说要做）；真做过的标 done。哲学闲聊、日常调情、寒暄、情绪流水账一律不记。宁少勿滥，没有值得记的就输出空数组 []。' + factsNote,
     messages: [{ role: 'user', content: [{ type: 'text', text: userMsg }] }],
     temperature: 0.3,
     maxTokens: 2000,
@@ -1564,7 +1631,9 @@ function recallBlock(eps, summary) {
     return eps.map((e) => {
       const ts = formatTs(e.ts)
       const when = ts ? `（${ts}）` : ''
-      return `· ${e.theme}${when}：${e.content}${e.mood ? `（${e.mood}）` : ''}`
+      // 带上状态标签：让她分得清「真发生过」和「只是聊过的构想」，别把畅想当事实说。
+      const tag = e.status === 'plan' ? '[说过要做]' : e.status === 'idea' ? '[构想]' : '[已发生]'
+      return `· ${tag} ${e.theme}${when}：${e.content}${e.mood ? `（${e.mood}）` : ''}`
     }).join('\n')
   }
   return summary ? '更早以前：' + summary : ''
@@ -1596,29 +1665,114 @@ function queryGrams(query) {
   return grams
 }
 
-function backtrackBlock(full, query) {
-  if (!query || !String(query).trim()) return ''
-  const grams = queryGrams(query)
-  if (!grams.length) return ''
+// ---------- 回忆式检索：从一句话里剥出真正要搜的实体词 ----------
+// 直接拿整句去 bigram 匹配，会被「之前/是不是/跟你说过」这类高频引导语淹没，
+// 实测「之前是不是跟你说过小猫团」会命中 207 条噪音。所以先把引导语剥掉。
+const RECALL_LEADINS = [
+  '你还记不记得', '你记不记得', '记不记得', '还记不记得', '记得不记得',
+  '之前是不是', '是不是跟你说过', '是不是说过', '跟你说过', '跟你说过吧',
+  '我之前跟你说', '之前跟你聊', '之前跟你讲', '之前说的', '之前聊的',
+  '上次说的', '上次聊的', '上次跟你', '之前那个', '上次那个', '那个叫什么',
+  '回忆一下', '想一下', '想一想', '想一想看', '你回忆', '我回忆',
+  '再回忆', '再想想', '想一想', '想起来', '想起', '回忆起',
+  '你还记得吧', '你记得吧', '记得吧', '你还记得我', '你还记得吗',
+  '我们聊过', '聊过什么', '提到过', '提过', '说过', '聊过', '讲过',
+  '之前', '上次', '以前', '是不是', '你还记得', '还记得', '记得',
+  '那个', '那个啥', '什么来着', '叫啥来着', '好像', '有点印象',
+  '现在', '你', '我', '再',
+]
+// 这些词出现才认为对方是在「让我回忆」，否则不搜，避免每句都翻旧账。
+const RECALL_CUES = /记不记得|还记得|记得|之前|上次|以前|说过|提过|聊过|讲过|那个啥|什么来着|叫啥来着|我们聊过|有印象|印象里|回忆|想起|想一想|想一下|再想/
+// 把整句压成干净的搜索词：去掉引导语、代词、标点。
+const RECALL_STOPWORDS = /(我们|你们|他们|你们俩|大家|大家伙|那个|这个|那些|这些|什么|怎么|是不是|有没有|对不对|能不能|可以吗|吗|呢|吧|啊|呀|哦|哈|嘛|了|的|地|得|就|也|还|都|又|再|很|挺|特别|真的|其实|反正|然后|但是|不过|所以|因为|如果|要是|的话|一下|一点|一些|个|只|种|你说|你讲|你提|你聊|叫啥|来着|叫|说|讲|提|聊|们)/g
+// 高频虚词：剥离后如果只剩这些，说明这句话没给实体词，不该拿去搜
+const RECALL_NOISE = /^(不是|没有|好像|经常|以前|之前|上次|这个|那个|这些|那些|东西|事情|事|话|那个啥|现在|再|又)$/
+
+function extractRecallTerms(query) {
+  let s = String(query || '')
+  // 长词优先剥，避免「之前是不是」被「之前」先吃掉一半
+  const sorted = [...RECALL_LEADINS].sort((a, b) => b.length - a.length)
+  for (const w of sorted) s = s.split(w).join(' ')
+  s = s.replace(/[，。！？、；：,.!?;:"'“”‘’（）()\[\]【】\s]+/g, ' ')
+  const terms = []
+  for (const part of s.split(' ')) {
+    let t = part.replace(RECALL_STOPWORDS, '').trim()
+    // 去掉「经常到X」「要做X」这类动词/副词粘连，只留实体部分
+    t = t.replace(/^(经常|常常|老是|总|已经|正在|打算|想要|准备|要做|想|要|做|搞|弄|整|到|过|回忆|想|再|又)+/, '').trim()
+    // 单字、以及「桌宠叫」这类动词残留，都不算有效搜索词
+    if (t.length >= 2 && t.length <= 12 && !terms.includes(t) &&
+        !/(叫|说|讲|提|聊|到)$/.test(t) && !RECALL_NOISE.test(t)) terms.push(t)
+  }
+  return terms
+}
+
+// 同义扩展：对方可能换个叫法说同一件事（猫团子 / 小猫团 / 电子猫）。
+const RECALL_ALIASES = [
+  ['猫团子', '小猫团', '猫团', '电子猫'],
+  ['桌宠', '桌宠娘', '桌面宠物'],
+  ['形象', '建模', '皮套', 'vtuber'],
+  ['成语接龙', '接龙'],
+  ['五子棋', '井字棋'],
+]
+
+function expandAliases(terms) {
+  const out = terms.slice()
+  for (const group of RECALL_ALIASES) {
+    if (terms.some((t) => group.some((g) => t.includes(g) || g.includes(t)))) {
+      for (const g of group) if (!out.includes(g)) out.push(g)
+    }
+  }
+  return out
+}
+
+// 判断这句话是不是在「让我回忆」，并返回要搜的词；不需要搜时返回空数组。
+function recallIntent(query) {
+  const s = String(query || '')
+  const terms = extractRecallTerms(s)
+  if (!terms.length) return []
+  // 开放式的「我们在聊什么」没有实体词可搜，走事件卡/摘要，不全文乱翻
+  if (/^在聊$/.test(terms.join('')) || terms.every((t) => /^(在聊|聊什|什么)$/.test(t))) return []
+  // 要么有回忆引导语，要么是用指示代词指代旧事（「那个猫团」这种）。
+  // 光有个名词不算——「我想吃火锅」不是让我翻旧账。
+  const hasCue = RECALL_CUES.test(s)
+  const pointsBack = /那个|那次|那回|那个啥|叫啥|什么来着/.test(s)
+  if (!hasCue && !pointsBack) return []
+  return expandAliases(terms)
+}
+
+// 关键词检索：按词出现次数和词长加权，而不是拿整句 bigram 撞运气。
+function searchHistory(full, terms, { hits = 2, window = 2 } = {}) {
   const msgs = Array.isArray(full) ? full : []
   const target = msgs.slice(0, -1) // 排除当前这条用户消息本身
-  if (!target.length) return ''
-  const minHits = grams.length <= 4 ? 1 : 2
-  const WINDOW = 5
+  if (!target.length || !terms.length) return ''
   const scored = []
   for (let i = 0; i < target.length; i++) {
     const c = target[i].content || ''
     if (!c) continue
-    let hits = 0
-    for (const g of grams) if (c.includes(g)) hits++
-    if (hits >= minHits) scored.push({ i, hits })
+    let score = 0
+    for (const t of terms) {
+      if (!t) continue
+      let n = 0
+      let at = c.indexOf(t)
+      while (at >= 0) { n += 1; at = c.indexOf(t, at + t.length) }
+      // 长词更可信，短词容易误伤
+      if (n > 0) score += n * Math.min(t.length, 4)
+    }
+    // 对方原话比她自己复述更接近「当初那件事」，同分时优先
+    if (score > 0) scored.push({ i, score: score + (target[i].role === 'user' ? 1 : 0) })
   }
   if (!scored.length) return ''
-  scored.sort((a, b) => b.hits - a.hits)
-  const top = scored.slice(0, 3).map((s) => s.i).sort((a, b) => a - b)
+  scored.sort((a, b) => b.score - a.score || a.i - b.i)
+  // 取分最高的几处，但避免取到几乎挨着的重复位置（同一段事没必要翻两遍）
+  const picked = []
+  for (const s of scored) {
+    if (picked.length >= hits) break
+    if (picked.some((p) => Math.abs(p.i - s.i) <= window * 6)) continue
+    picked.push(s)
+  }
   const idx = new Set()
-  for (const i of top) {
-    for (let j = Math.max(0, i - WINDOW); j <= Math.min(target.length - 1, i + WINDOW); j++) idx.add(j)
+  for (const p of picked) {
+    for (let j = Math.max(0, p.i - window); j <= Math.min(target.length - 1, p.i + window); j++) idx.add(j)
   }
   const lines = [...idx].sort((a, b) => a - b).map((i) => {
     const m = target[i]
@@ -1626,7 +1780,18 @@ function backtrackBlock(full, query) {
     const ts = formatTs(m.ts)
     return ts ? `[${ts}] ${role}：${m.content}` : `${role}：${m.content}`
   })
-  return '【从之前的聊天记录里翻到，可能和你的问题有关】\n' + lines.join('\n')
+  return lines.join('\n')
+}
+
+// 兼容旧调用：对方是在回忆时，返回注入用的上下文块。
+// opts.terms 已给定时直接用它检索（调用方已经判断过意图）。
+function backtrackBlock(full, query, opts = {}) {
+  const terms = Array.isArray(opts.terms) && opts.terms.length ? opts.terms : recallIntent(query)
+  if (!terms.length) return ''
+  const body = searchHistory(full, terms, opts)
+  if (!body) return ''
+  return '【你刚从以前的聊天记录里翻到这几句，可能和对方问的有关】\n' + body +
+    '\n（这是翻出来的旧片段，可能不完整、也可能不是对方想的那次；不确定就直说记不清，别硬编。）'
 }
 
 // ---------- 模型 ----------
@@ -1710,6 +1875,23 @@ function isBusyError(message) {
   const s = String(message || '')
   if (/余额|额度|积分|到期|用完|不足|insufficient|balance|exhaust|expired/i.test(s)) return false
   return /429|并发|拥挤|稍后重试|rate.?limit|too many|busy/i.test(s)
+}
+
+// 服务器到模型中转那一跳的偶发网络抖动（undici 常见报错 + Node 网络错误码）。
+// 额度类错误绝不在这里重试，要去续卡，重试也没用。
+function isNetworkGlitch(message) {
+  const s = String(message || '')
+  if (/余额|额度|积分|到期|用完|不足|insufficient|balance|exhaust|expired/i.test(s)) return false
+  // 上游中转的 5xx 和「连接在响应前就断了」这类瞬时故障，都算网络抖动，可重试
+  return /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|socket hang up|terminated|network|relay 5\d\d|relay 502|relay 503|relay 504|upstream|bad gateway|service unavailable/i.test(s)
+}
+
+// 给用户看的报错文案：绝不把 "fetch failed" 这种原文亮出来，太破坏沉浸感。
+function friendlyError(message) {
+  const s = String(message || '')
+  if (isNetworkGlitch(s)) return '刚才网络抖了一下没接上话，你再说一遍好啦'
+  if (isBusyError(s)) return '她那边有点挤，稍等一下再发一次'
+  return s.slice(0, 300)
 }
 
 // ---------- 路由 ----------
@@ -2174,10 +2356,62 @@ async function chat(ctx, req, res) {
   const lastUser = [...full].reverse().find((m) => m.role === 'user')
   const recall = lastUser ? dedupNegativeRecall(recallEpisodes(lastUser.content, mem)) : []
   const recallStr = lastUser ? recallBlock(recall, mem.summary) : ''
-  const hasQuestion = lastUser ? /[?？]/.test(lastUser.content) : false
-  const backStr = lastUser && (recall.length === 0 || hasQuestion)
-    ? backtrackBlock(full, lastUser.content)
-    : ''
+  // 何时才去翻全文：对方明确在让我回忆，或者事件卡命中了但内容明显残缺。
+  // 其余情况一律不搜，避免每句话都去翻旧账。
+  let backStr = ''
+  if (lastUser) {
+    let terms = recallIntent(lastUser.content)
+    // 事件卡命中时，用卡里的关键词补一轮：能接住「对方只说了半句、我想顺着旧事往下聊」的情况
+    if (!terms.length && recall.length) {
+      const kw = recall.flatMap((e) => (Array.isArray(e.keywords) ? e.keywords : []))
+        .map((s) => String(s || '').trim())
+        .filter((s) => s.length >= 2 && lastUser.content.includes(s))
+      if (kw.length) terms = expandAliases(kw)
+    }
+    // 事件卡命中却没说清（内容很短/带未说明字样），说明记忆残缺，值得回原文补齐
+    const thinRecall = recall.some((e) => {
+      const body = String((e && e.content) || '')
+      return body.length < 24 || NEGATIVE_MEMORY_RE.test(body)
+    })
+    if (terms.length || thinRecall) {
+      // 有明确实体词就直接用它搜；只有残缺卡时，用对方原话里的词去搜
+      const searchTerms = terms.length ? terms : extractRecallTerms(lastUser.content)
+      // 关键：前端只发最近几十条，翻旧账必须用服务端全量记录，否则搜不到更早的事
+      const stored = loadCurrent()
+      const storedMsgs = stored && Array.isArray(stored.messages) ? normMessages(stored.messages) : []
+      const searchPool = storedMsgs.length > full.length ? storedMsgs : full
+      // 把当前这条用户消息临时拼到末尾，让 backtrackBlock 的「排除最后一条」逻辑仍然成立
+      const poolWithCurrent = searchPool.concat([lastUser])
+      backStr = backtrackBlock(poolWithCurrent, lastUser.content, { terms: searchTerms, hits: 2, window: 1 })
+    }
+  }
+  // 归纳层：把搜到的碎片读成一段连贯记忆。对方明确在回忆时才做，且按主题词缓存。
+  let digestText = ''
+  const recallTerms = lastUser ? recallIntent(lastUser.content) : []
+  // 只有对方明确在「回忆某件事」时才整理；普通闲聊即使事件卡误命中也不触发。
+  // 否则发张照片、聊句天气都会被当成旧事去整理，既烧额度又污染缓存。
+  if (lastUser && recallTerms.length) {
+    const key = digestKey(lastUser.content, recallTerms)
+    const digests = loadDigest()
+    if (digests[key]) {
+      digestText = String(digests[key])
+    } else {
+      // 缓存没有就不阻塞主聊天：先用原始碎片正常接话，整理放到后台异步做，
+      // 下一次再聊同一主题时缓存就绪，她就能准确说出来了。避免「一回忆就卡住等好久」。
+      const recallSnapshot = recall.slice()
+      const backSnapshot = backStr
+      ;(async () => {
+        const text = await digestRecall(ctx, lastUser.content, recallSnapshot, backSnapshot)
+        if (!text) return
+        const cur = loadDigest()
+        cur[key] = text
+        const entries = Object.entries(cur)
+        const trimmed = {}
+        for (const [k, v] of entries.slice(-30)) trimmed[k] = v
+        writeDigest(trimmed)
+      })()
+    }
+  }
   // 旧的关键词注入 + 新的 L0 词条层（含敏感词条按需展开）
   const factsStr = factsBlock() + '\n\n' + (lastUser ? factsBlockForMessage(lastUser.content) : '')
 
@@ -2261,6 +2495,7 @@ async function chat(ctx, req, res) {
 
   try {
     let attempt = 0
+    let netAttempts = 0
     for (;;) {
       attempt += 1
       try {
@@ -2273,6 +2508,7 @@ async function chat(ctx, req, res) {
           provider,
           model,
           system: buildSystem(memory, recallStr, backStr, factsStr, history)
+            + (digestText ? '\n\n【你已经想起来的这段记忆，直接用这个口吻说，别再说「记不清」】\n' + digestText : '')
             + (gameBlock(game) ? '\n\n' + gameBlock(game) : '\n\n【关于棋局】如果对方提到下棋、复盘或这局怎么下的，你现在手上没有具体棋局面，直接说记不清或不知道，绝不许自己编造棋盘或结果。')
             + (memoBlock(memo) ? '\n\n' + memoBlock(memo) : '')
             + (quoteContextText ? '\n\n【对方引用了一句你们之前说过的话】\n' + quoteContextText + '\n\n请结合这段话接话，不用再翻更多，找到答案就停。' : ''),
@@ -2287,7 +2523,7 @@ async function chat(ctx, req, res) {
           if (isText(chunk)) {
             for (const b of splitter.push(chunk.text)) emit(b)
           } else if (chunk && chunk.type === 'finish' && chunk.reason && chunk.reason.kind === 'error') {
-            sse(res, { type: 'error', message: (chunk.reason.failure && chunk.reason.failure.message) || '模型出错了' })
+            sse(res, { type: 'error', message: friendlyError((chunk.reason.failure && chunk.reason.failure.message) || '模型出错了') })
           }
         }
         for (const b of splitter.flush()) emit(b)
@@ -2295,12 +2531,18 @@ async function chat(ctx, req, res) {
         break
       } catch (error) {
         const msg = String((error && error.message) || error)
-        // 并发被占满：别把这口气撒给用户，原地排个队再试。
-        // 还没出过气泡时才重试，避免重复输出。
-        if (!stalled && count === 0 && attempt < MAX_BUSY_ATTEMPTS && isBusyError(msg)) {
-          const waitMs = BUSY_BASE_MS * attempt
-          sse(res, { type: 'wait', ms: waitMs, text: '她那边有点挤，我排一下队…' })
-          await sleep(waitMs)
+        // 并发被占满 / 网络抖动：还没出过气泡时都原地重试，别把原始报错撒给用户。
+        const retryable = count === 0 && (isBusyError(msg) || isNetworkGlitch(msg))
+        if (!stalled && retryable && (isBusyError(msg) ? attempt < MAX_BUSY_ATTEMPTS : netAttempts < 3)) {
+          if (isBusyError(msg)) {
+            const waitMs = BUSY_BASE_MS * attempt
+            sse(res, { type: 'wait', ms: waitMs, text: '她那边有点挤，我排一下队…' })
+            await sleep(waitMs)
+          } else {
+            netAttempts += 1
+            const waitMs = 1500 * netAttempts
+            await sleep(waitMs)
+          }
           lastActivity = Date.now()
           continue
         }
@@ -2312,7 +2554,7 @@ async function chat(ctx, req, res) {
     if (stalled) {
       sse(res, { type: 'error', message: '这次等太久没等到回复，你再说一句，我重新接。' })
     } else {
-      sse(res, { type: 'error', message: String((error && error.message) || error).slice(0, 300), quota: isQuota })
+      sse(res, { type: 'error', message: friendlyError((error && error.message) || error), quota: isQuota })
     }
   } finally {
     clearInterval(heartbeat)

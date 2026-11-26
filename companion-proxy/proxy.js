@@ -187,6 +187,12 @@ async function readBody(req) {
 
 const server = http.createServer(async (req, res) => {
   const url = req.url || '/'
+  // 根路径直接跳转到 /liao，省得用户看到「只转发了 /liao」这种内部提示
+  if (url === '/' || url === '') {
+    res.writeHead(302, { location: PREFIX })
+    res.end()
+    return
+  }
   if (!url.startsWith(PREFIX)) {
     res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
     res.end('只转发了 ' + PREFIX)

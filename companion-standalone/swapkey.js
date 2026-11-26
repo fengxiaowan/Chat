@@ -2,12 +2,15 @@
 // 流程：先问要不要换 API 地址（换则写入 config.json + liao.html），
 // 再问新 key，替换各文件里的 sk- 密钥，重启 8788，用最终地址验证。
 //
+// 一次改全四处：DSH(relay provider) / 网页聊天(8788) / Codex(config.toml) / Codex(models.json)
+//
 // 2026-11 修复：
 //  1) 地址那一问也可以直接粘 sk- 密钥（以前会报「地址要以 http:// 开头」直接退出）
 //  2) 地址填错不再 exit，而是重问；并拦截 platform.deepseek.com 网页地址
-//  3) 切到官方接口时自动把模型名换成官方名
+//  3) 切地址时自动把模型名换成该服务商那套（官方 deepseek-flash / 中转 deepseek-v4-flash）
 //  4) 补上 config.local.json —— server.js 里它优先级最高，以前从不更新它，
 //     所以 key 写进 config.json 也「换不上」
+//  5) 同步 Codex：config.toml 的 [model_providers.deepseek] 地址+密钥、models.json 的模型名
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { execFileSync, spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
@@ -27,6 +30,10 @@ const TARGETS = [
 const VBS = `${ROOT}/companion-standalone/start.vbs`
 const CREDS = 'C:/Users/lyy44/.dsh/.credentials.yaml'
 const DSH_PROFILE = `${process.env.USERPROFILE}/.dsh/profiles/desktop/cordis.patch.yml`
+// Codex 的两份配置：config.toml 里 [model_providers.deepseek] 的地址+key，
+// models.json 里两个模型的 slug（slug 会被原样当模型名发出去）
+const CODEX_CONFIG = `${process.env.USERPROFILE}/.codex/config.toml`
+const CODEX_MODELS = `${process.env.USERPROFILE}/.codex/models.json`
 const KEY_RE = /sk-[A-Za-z0-9\-_]{20,}/g
 const KEY_ONLY_RE = /^sk-[A-Za-z0-9\-_]{20,}$/
 // liao.html 里写死的 baseUrl / apiKey 两行，精确匹配替换
@@ -36,6 +43,13 @@ const LIAO_BASE_READ_RE = /"baseUrl"\s*:\s*"([^"]*)"/
 
 // 官方接口对应的模型名（中转站那套 deepseek-v4-flash 在官方也叫 deepseek-flash）
 const OFFICIAL_MODELS = { chatModel: 'deepseek-v4-pro', extractModel: 'deepseek-flash' }
+// 中转站（tmai.ak03.cn 这类）的模型名
+const RELAY_MODELS = { chatModel: 'deepseek-v4-pro', extractModel: 'deepseek-v4-flash' }
+// Codex 的 models.json 里两个槽位 → 各家模型名
+const CODEX_SLUGS = {
+  official: { pro: 'deepseek-v4-pro', flash: 'deepseek-flash' },
+  relay: { pro: 'deepseek-v4-pro', flash: 'deepseek-v4-flash' },
+}
 
 function readJson(f) {
   return JSON.parse(readFileSync(f, 'utf8'))
@@ -125,6 +139,65 @@ function dshRelayBase() {
   } catch { return '' }
 }
 
+// 是不是官方 DeepSeek 接口（决定用哪套模型名）
+function isOfficial(baseUrl) {
+  return /api\.deepseek\.com/i.test(String(baseUrl || ''))
+}
+
+// 改 Codex 的 config.toml：只动 [model_providers.deepseek] 段里的 base_url 和
+// experimental_bearer_token，其他段落（含 deepseek-relay 备份）原样保留。
+function patchCodexConfig(baseUrl, apiKey) {
+  if (!existsSync(CODEX_CONFIG)) return '[!] 跳过 Codex: 没有 config.toml'
+  let t = readFileSync(CODEX_CONFIG, 'utf8')
+  // 用「行扫描」定位段：从 [model_providers.deepseek] 那一行起，到下一个 [ 开头的行之前
+  const lines = t.split(/\r?\n/)
+  const start = lines.findIndex((l) => /^\s*\[model_providers\.deepseek\]\s*$/.test(l))
+  if (start < 0) return '[!] 跳过 Codex: config.toml 里没有 [model_providers.deepseek] 段'
+  let end = lines.length
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^\s*\[/.test(lines[i])) { end = i; break }
+  }
+  let touched = 0
+  let found = 0
+  for (let i = start + 1; i < end; i++) {
+    const b = lines[i]
+    let a = b
+    if (/(base_url\s*=\s*")[^"]*(")/.test(a)) found++
+    if (/(experimental_bearer_token\s*=\s*")[^"]*(")/.test(a)) found++
+    a = a.replace(/(base_url\s*=\s*")[^"]*(")/, `$1${baseUrl}$2`)
+    a = a.replace(/(experimental_bearer_token\s*=\s*")[^"]*(")/, `$1${apiKey}$2`)
+    if (a !== b) { lines[i] = a; touched++ }
+  }
+  if (!found) return '[!] 跳过 Codex: 段里没找到 base_url / token 字段'
+  t = lines.join('\n')
+  // 顶层默认模型名也跟着换（否则默认模型还是旧名字，一启动就 400）
+  const slugs = isOfficial(baseUrl) ? CODEX_SLUGS.official : CODEX_SLUGS.relay
+  t = t.replace(/^model = "[^"]*"/m, `model = "${slugs.flash}"`)
+  writeFileSync(CODEX_CONFIG, t, 'utf8')
+  return touched
+    ? `[OK] Codex config.toml: 地址+密钥已更新(${touched} 行)，默认模型 ${slugs.flash}`
+    : `[OK] Codex config.toml: 地址+密钥已是目标值，默认模型 ${slugs.flash}`
+}
+
+// 改 Codex 的 models.json：两个槽位（pro / flash）的 slug 换成该服务商的模型名
+function patchCodexModels(baseUrl) {
+  if (!existsSync(CODEX_MODELS)) return '[!] 跳过 Codex: 没有 models.json'
+  const slugs = isOfficial(baseUrl) ? CODEX_SLUGS.official : CODEX_SLUGS.relay
+  const j = readJson(CODEX_MODELS)
+  const list = j.models || j
+  const changed = []
+  for (const m of list) {
+    // 按「是不是 pro」判断槽位，不依赖当前 slug 拼写
+    const isPro = /pro/i.test(String(m.slug || '')) || /pro/i.test(String(m.display_name || ''))
+    const target = isPro ? slugs.pro : slugs.flash
+    if (m.slug !== target) { changed.push(`${m.slug}→${target}`); m.slug = target }
+  }
+  writeJson(CODEX_MODELS, j)
+  return changed.length
+    ? `[OK] Codex models.json: ${changed.join(', ')}`
+    : `[OK] Codex models.json: 模型名已是 ${slugs.pro} / ${slugs.flash}`
+}
+
 async function main() {
   let cfg = readJson(CONFIG)
   const oldBase = cfg.baseUrl || '(未设置)'
@@ -134,10 +207,10 @@ async function main() {
   const step1 = await askNewBaseUrl()
   if (step1.baseUrl) {
     cfg.baseUrl = step1.baseUrl
-    if (/api\.deepseek\.com/i.test(cfg.baseUrl)) {
-      cfg = { ...cfg, ...OFFICIAL_MODELS }
-      console.log(`  已切到官方接口，模型同步为 ${OFFICIAL_MODELS.chatModel} / ${OFFICIAL_MODELS.extractModel}`)
-    }
+    // 模型名跟着服务商走：官方用 deepseek-flash，中转用 deepseek-v4-flash
+    const models = isOfficial(cfg.baseUrl) ? OFFICIAL_MODELS : RELAY_MODELS
+    cfg = { ...cfg, ...models }
+    console.log(`  模型同步为 ${models.chatModel} / ${models.extractModel}`)
     writeJson(CONFIG, cfg)
     console.log(`[OK] 新地址已写入 config.json: ${cfg.baseUrl}\n`)
   } else {
@@ -228,7 +301,16 @@ async function main() {
     }
   }
 
-  // 4) 重启 8788
+  // 4) Codex：config.toml 的地址+密钥、models.json 的模型名，一起换
+  console.log('\n同步 Codex 配置...')
+  try {
+    console.log(patchCodexConfig(cfg.baseUrl, newKey))
+    console.log(patchCodexModels(cfg.baseUrl))
+  } catch (e) {
+    console.log(`[X] Codex 配置更新失败: ${e.message}`)
+  }
+
+  // 5) 重启 8788
   // 以前用 powershell Get-NetTCPConnection 取 PID，在部分环境下返回空 —— 结果旧进程没被
   // 杀掉、新进程绑不上端口静默失败，看起来「重启成功」，其实还在用旧 key。改用 netstat 解析。
   console.log('\n重启 8788 服务...')
@@ -282,7 +364,7 @@ async function main() {
   } catch (e) {
     console.log(`[!] 验证网络出错: ${e.message} (密钥已写入, 稍后可再试)`)
   }
-  console.log('\n完成! 刷新聊天页即可使用.')
+  console.log('\n完成! 聊天页刷新即可；Codex 重启后生效.')
   closeAsk()
 }
 

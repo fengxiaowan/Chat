@@ -1,7 +1,7 @@
 {
-  "baseUrl": "https://tmai.ak03.cn/v1",
+  "baseUrl": "https://api.deepseek.com/v1",
   "chatModel": "deepseek-v4-pro",
-  "extractModel": "deepseek-v4-flash",
+  "extractModel": "deepseek-flash",
   "port": 8788,
-  "apiKey": "sk-ar-bb4230be31055381630d8dfda36d00d41ee9780d8389d77695a3d272ccbd1d5f"
+  "apiKey": "sk-066be2211ea9434a977d4d8885b5d589"
 }

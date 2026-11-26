@@ -5,6 +5,7 @@
 import http from 'node:http'
 import { readFileSync, existsSync, appendFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { gzipSync, brotliCompressSync } from 'node:zlib'
 import { apply as applyPlugin } from '../companion-plugin/index.js'
 
 const CONFIG_PATH = fileURLToPath(new URL('./config.json', import.meta.url))
@@ -172,15 +173,60 @@ function matchRoute(pathname, method) {
 async function sendWebResponse(res, resp) {
   const headers = {}
   resp.headers.forEach((v, k) => { headers[k] = v })
-  res.writeHead(resp.status || 200, headers)
-  if (!resp.body) { res.end(); return }
+
+  // 文本类响应（HTML/JS/CSS/JSON）压缩后再发：手机流量下能省 60%~80% 的传输量。
+  // 这是 WiFi 顺畅、流量灾难的核心差异——带宽小的时候，体积就是体验。
+  const ctype = String(headers['content-type'] || '')
+  const compressible = /text\/|javascript|json|svg|xml/i.test(ctype)
+
+  if (!resp.body) { res.writeHead(resp.status || 200, headers); res.end(); return }
+
+  // SSE / 流式响应必须原样透传，绝不能缓冲或压缩，否则整段回复要等生成完才出现
+  if (/event-stream/i.test(ctype)) {
+    res.writeHead(resp.status || 200, headers)
+    const reader0 = resp.body.getReader()
+    while (true) {
+      const { done, value } = await reader0.read()
+      if (done) break
+      res.write(Buffer.from(value))
+    }
+    res.end()
+    return
+  }
+
+  // 读完整 body（页面/脚本/JSON 都很小，一次读完再压缩最简单可靠）
   const reader = resp.body.getReader()
+  const chunks = []
   while (true) {
     const { done, value } = await reader.read()
     if (done) break
-    res.write(Buffer.from(value))
+    chunks.push(Buffer.from(value))
   }
-  res.end()
+  let body = Buffer.concat(chunks)
+
+  const accept = String(res.req?.headers?.['accept-encoding'] || '')
+  if (compressible && body.length > 512) {
+    // 优先 brotli（比 gzip 再小 15%~20%）
+    if (/br/.test(accept)) {
+      try {
+        body = brotliCompressSync(body)
+        headers['content-encoding'] = 'br'
+      } catch {}
+    }
+    if (!headers['content-encoding'] && /gzip/.test(accept)) {
+      try {
+        body = gzipSync(body, { level: 9 })
+        headers['content-encoding'] = 'gzip'
+      } catch {}
+    }
+    if (headers['content-encoding']) {
+      delete headers['content-length']
+      headers['vary'] = headers['vary'] ? headers['vary'] + ', Accept-Encoding' : 'Accept-Encoding'
+    }
+  }
+  headers['content-length'] = String(body.length)
+  res.writeHead(resp.status || 200, headers)
+  res.end(body)
 }
 
 const server = http.createServer(async (req, res) => {

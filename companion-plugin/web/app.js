@@ -1342,6 +1342,21 @@
       }
     } catch (e) { console.error('[xq] 引擎初始化失败', e); }
   }
+
+  // 象棋引擎按需加载：57KB 的 wukong.js 只在第一次打开象棋时才拉，
+  // 平时聊天（尤其手机流量）不背这个包袱。
+  function ensureXqEngine() {
+    if (XQ.engine) return Promise.resolve(true);
+    if (window.__xqLoading) return window.__xqLoading;
+    window.__xqLoading = new Promise((resolve) => {
+      const s = document.createElement('script');
+      s.src = BASE + '/vendor/wukong.js?v=20261126album';
+      s.onload = () => { initXq(); resolve(!!XQ.engine); };
+      s.onerror = () => { window.__xqLoading = null; resolve(false); };
+      document.head.appendChild(s);
+    });
+    return window.__xqLoading;
+  }
   function xqPieceAt(sq) {
     if (!XQ.engine) return 0;
     return XQ.engine.getPiece(sq);
@@ -1816,6 +1831,7 @@
     } catch {}
   }
   function xqLoad() {
+    if (!XQ.engine) return;
     try {
       const saved = read(XQ_KEY, null);
       if (saved && typeof saved.fen === 'string' && saved.fen) {
@@ -1836,7 +1852,7 @@
     } catch {}
   }
   function xqNew() {
-    initXq();
+    ensureXqEngine();
     if (!XQ.engine) return;
     XQ.engine.setBoard(XQ.engine.START_FEN);
     XQ.startFen = XQ.engine.START_FEN;
@@ -1887,10 +1903,9 @@
   if (xqAiFirstBtn) xqAiFirstBtn.addEventListener('click', xqAiFirst);
   // 切到象棋 tab 时初始化
   function xqEnsure() {
-    initXq();
-    if (XQ.engine) {
-      xqLoad();
-    }
+    ensureXqEngine().then((ok) => {
+      if (ok && XQ.engine) xqLoad();
+    });
   }
 
   let ttsAudio = null;
@@ -2487,7 +2502,7 @@
 
     try {
       // 只发最近 S.limit 条（后端 historyTurns 也按这个数切），省上行带宽、更快拿到首字节
-      const payload = { notes: S.notes, messages: S.history.slice(-S.limit) };
+      const payload = { notes: S.notes, messages: S.history.slice(-S.limit), tts: autoPlay };
       // 只在棋局进行中、且当前正开着棋类侧栏时才带上棋局，避免她凭空催人下棋
       const activeMode = localStorage.getItem('companion.panelMode.v1') || 'game';
       const gomokuOrTic = activeMode === 'game' || activeMode === 'gomoku';

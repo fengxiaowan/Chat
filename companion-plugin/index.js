@@ -2038,6 +2038,16 @@ function stripKaomoji(text) {
   return s
 }
 
+// 语音生成串行闸门：edge-tts 是外部进程，并发多了会互相抢、生成出截断/空文件。
+// 之前前端串行请求天然串行；上一轮加了后端预热后变成并发，才出现的截断。
+// 这里统一改成一次只跑一个 edge-tts，其余排队。
+let ttsGate = Promise.resolve()
+function scheduleTts(task) {
+  const run = ttsGate.then(task, task)
+  ttsGate = run.then(() => {}, () => {})
+  return run
+}
+
 async function synthTts(text) {
   const voice = ttsVoice()
   const rate = ttsRate()
@@ -2047,7 +2057,9 @@ async function synthTts(text) {
   if (existsSync(mp3)) return mp3
   const old = TTS_INFLIGHT.get(hash)
   if (old) return old
-  const job = (async () => {
+  const job = scheduleTts(async () => {
+    // 排队期间可能已经被别的请求生成了，再查一次避免重复生成
+    if (existsSync(mp3)) return mp3
     try { mkdirSync(TTS_URL, { recursive: true }) } catch {}
     const txt = new URL(hash + '.txt', TTS_URL)
     writeFileSync(txt, text, 'utf8')
@@ -2076,7 +2088,7 @@ async function synthTts(text) {
       throw err
     }
     return mp3
-  })()
+  })
   TTS_INFLIGHT.set(hash, job)
   try {
     return await job
@@ -2120,13 +2132,13 @@ async function serveGet(request) {
     return new Response(readFileSync(new URL(asset[0], ROOT)), {
       headers: {
         'content-type': asset[1],
+        // 静态资源按内容版本号（index.html 里的 ?v=）长效缓存：刷新不再重新下载。
+        // app.js / style.css / vendor 都走 immutable，更新代码时改 index.html 的版本号即可。
         'cache-control': path === `${BASE}/sw.js`
           ? 'no-cache'
-          : path.endsWith('.vrm')
+          : path.endsWith('.vrm') || path.endsWith('.js') || path.endsWith('.css')
             ? 'public, max-age=31536000, immutable'
-            : path.includes('/vendor/')
-              ? 'no-cache'
-              : 'public, max-age=300, must-revalidate',
+            : 'public, max-age=300, must-revalidate',
         ...(path === `${BASE}/sw.js` ? { 'service-worker-allowed': BASE } : {}),
       },
     })
@@ -2494,6 +2506,9 @@ async function chat(ctx, req, res) {
   const memory = cleanNotes(body && body.notes)
   const game = body && body.game ? body.game : null
   const memo = body && body.memo ? body.memo : null
+  // 前端开了自动朗读才预热语音：流式吐字的同时把 edge-tts 生成跑起来，
+  // 等前端来取 /tts 时多半已经生成好，只剩下载，手机流量下省掉生成等待。
+  const wantTts = !!(body && body.tts)
   // 微信式引用：从最后一条用户消息的 meta.quote 提取被引用的原文
   // 注意：引用可能是单独一条消息，附话是下一条，所以要找最近一条带 meta.quote 的 user 消息
   const quotedMsg = [...normMessages(body && body.messages)].reverse().find((m) => m.role === 'user' && m.meta && typeof m.meta.quote === 'string')
@@ -2628,6 +2643,7 @@ async function chat(ctx, req, res) {
     count += 1
     if (count > cfg.maxBubbles) { tail += bubble; return }
     sse(res, { type: 'bubble', text: bubble })
+    if (wantTts) synthTts(bubble).catch(() => {})
   }
 
   // 心跳 + 死等保护
@@ -2686,7 +2702,10 @@ async function chat(ctx, req, res) {
           }
         }
         for (const b of splitter.flush()) emit(b)
-        if (tail) sse(res, { type: 'bubble', text: tail })
+        if (tail) {
+          sse(res, { type: 'bubble', text: tail })
+          if (wantTts) synthTts(tail).catch(() => {})
+        }
         // 官方接口偶发返回「finish=stop 但 content 为空」的空回复（实测约一半概率）。
         // 这时下面没有气泡可发，前端只会收到 thinking 和 done，表现成「正在输入消失后什么都没发生」。
         // 所以空回复当异常处理，走重试；重试也空才报错，绝不让它静默结束。

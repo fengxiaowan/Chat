@@ -420,6 +420,42 @@ header {
   cursor: crosshair;
   touch-action: none;
 }
+
+/* 相册 */
+.album-shell {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  overflow-y: auto;
+  background: radial-gradient(circle at 50% 25%, #fffdf7 0%, #f8f2e5 60%, #f1e7d8 100%);
+}
+.album-head { display: flex; align-items: center; gap: 6px; }
+.album-title { font-size: 15px; font-weight: 600; color: #5c5348; flex: 1; }
+.album-status { font-size: 12px; color: #a28b6f; }
+.album-btn {
+  border: 1px solid #e0d5c3; background: #fff; color: #6f6250;
+  font-size: 16px; width: 28px; height: 28px; border-radius: 6px;
+  cursor: pointer; display: flex; align-items: center; justify-content: center;
+}
+.album-btn:hover { background: #faf5ec; }
+.album-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; }
+.album-card {
+  border: 1px solid #e5d9c4; border-radius: 10px; background: #fffdf7;
+  padding: 6px; display: flex; flex-direction: column; gap: 6px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.04);
+}
+.album-img {
+  width: 100%; aspect-ratio: 1 / 1; object-fit: cover;
+  border-radius: 8px; background: #f1e7d8;
+}
+.album-caption {
+  font-size: 12px; color: #6f6250; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word;
+}
+.album-actions { display: flex; gap: 6px; justify-content: flex-end; }
 .avatar-badge {
   position: absolute;
   left: 12px;
@@ -599,6 +635,16 @@ footer {
 }
 .chat-img { max-width: 220px; max-height: 220px; border-radius: 8px; display: block; }
 .img-bubble { padding: 4px; }
+.chat-img-wrap { position: relative; display: inline-block; }
+.chat-img-wrap .chat-img { max-width: 220px; max-height: 220px; border-radius: 8px; display: block; }
+.chat-img-save {
+  position: absolute; right: 6px; bottom: 6px;
+  border: 0; background: rgba(0,0,0,.35); color: #fff;
+  width: 24px; height: 24px; border-radius: 50%;
+  font-size: 13px; line-height: 1; cursor: pointer;
+  opacity: 0; transition: opacity .15s ease;
+}
+.chat-img-wrap:hover .chat-img-save { opacity: 1; }
 .load-more {
   text-align: center; color: #07c160; cursor: pointer;
   padding: 10px 0; font-size: 13px;

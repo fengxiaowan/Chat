@@ -494,11 +494,13 @@
     const memoShell = $('memo-shell');
     const drawShell = $('draw-shell');
     const xiangqiShell = $('xiangqi-shell');
+    const albumShell = $('album-shell');
     if (avatarShell) avatarShell.hidden = mode !== 'avatar';
     if (gameShell) gameShell.hidden = mode !== 'game' && mode !== 'gomoku';
     if (memoShell) memoShell.hidden = mode !== 'memo';
     if (drawShell) drawShell.hidden = mode !== 'draw';
     if (xiangqiShell) xiangqiShell.hidden = mode !== 'xiangqi';
+    if (albumShell) albumShell.hidden = mode !== 'album';
     if (mode === 'avatar') return;
     if (mode === 'memo') {
       localStorage.setItem('companion.panelMode.v1', mode);
@@ -513,6 +515,11 @@
     if (mode === 'xiangqi') {
       localStorage.setItem('companion.panelMode.v1', mode);
       xqEnsure();
+      return;
+    }
+    if (mode === 'album') {
+      localStorage.setItem('companion.panelMode.v1', mode);
+      loadAlbums();
       return;
     }
     const kind = mode === 'gomoku' ? 'gomoku' : 'tictactoe';
@@ -545,7 +552,7 @@
     });
   });
   // 默认井字棋（形象已隐藏）
-  const savedMode = ['gomoku', 'memo', 'draw', 'xiangqi'].includes(localStorage.getItem('companion.panelMode.v1'))
+  const savedMode = ['gomoku', 'memo', 'draw', 'xiangqi', 'album'].includes(localStorage.getItem('companion.panelMode.v1'))
     ? localStorage.getItem('companion.panelMode.v1')
     : 'game';
   localStorage.setItem('companion.panelMode.v1', savedMode);
@@ -555,6 +562,129 @@
       if (t.dataset.mode === savedMode) t.click();
     });
   }, 0);
+
+  // ---------- 相册 ----------
+  // 收藏珍贵图片 + 配文，可以指给她看、共同回忆。图片复用 images 目录。
+  const albumGridEl = $('album-grid');
+  const albumStatusEl = $('album-status');
+  const albumUploadBtn = $('album-upload');
+  const albumFileEl = $('album-file');
+  const A = { items: [] };
+
+  async function loadAlbums() {
+    if (!albumGridEl) return;
+    try {
+      const d = await (await fetch(BASE + '/albums', { cache: 'no-store' })).json();
+      A.items = Array.isArray(d.albums) ? d.albums : [];
+    } catch { A.items = []; }
+    renderAlbums();
+  }
+
+  function renderAlbums() {
+    if (!albumGridEl) return;
+    albumGridEl.innerHTML = '';
+    if (!A.items.length) {
+      albumGridEl.innerHTML = '<p class="mem-empty">还没有收藏的照片。点右上角 ＋ 收一张，或在聊天图片上点 📷。</p>';
+      return;
+    }
+    for (const it of A.items) {
+      const card = document.createElement('div');
+      card.className = 'album-card';
+      const im = document.createElement('img');
+      im.className = 'album-img';
+      im.loading = 'lazy';
+      im.src = BASE + '/img/' + it.hash;
+      const cap = document.createElement('div');
+      cap.className = 'album-caption';
+      cap.textContent = it.caption || '';
+      const actions = document.createElement('div');
+      actions.className = 'album-actions';
+      const show = document.createElement('button');
+      show.type = 'button'; show.className = 'mini'; show.textContent = '给她看';
+      show.addEventListener('click', () => albumShow(it));
+      const edit = document.createElement('button');
+      edit.type = 'button'; edit.className = 'mini'; edit.textContent = '改';
+      edit.addEventListener('click', () => albumEditCaption(it));
+      const del = document.createElement('button');
+      del.type = 'button'; del.className = 'mini'; del.textContent = '删';
+      del.addEventListener('click', async () => {
+        if (!confirm('删掉这张照片？')) return;
+        await albumPost('delete', it.id);
+        loadAlbums();
+      });
+      actions.appendChild(show);
+      actions.appendChild(edit);
+      actions.appendChild(del);
+      card.appendChild(im);
+      card.appendChild(cap);
+      card.appendChild(actions);
+      albumGridEl.appendChild(card);
+    }
+  }
+
+  async function albumPost(action, id, fields) {
+    try {
+      const r = await fetch(BASE + '/album', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, id, ...(fields || {}) }),
+      });
+      const d = await r.json();
+      if (!r.ok) { alert((d && d.error) || '操作失败'); return null; }
+      return d;
+    } catch { alert('操作失败'); return null; }
+  }
+
+  // 收藏到相册：im 可能是服务器 hash 或 base64 dataUrl
+  async function saveToAlbum(im) {
+    const caption = prompt('给这张照片配句话（可留空）：');
+    if (caption === null) return;
+    const isData = String(im).startsWith('data:');
+    const d = await albumPost('save', '', isData ? { dataUrl: im, caption } : { hash: im, caption });
+    if (d && d.ok) loadAlbums();
+  }
+
+  async function albumEditCaption(it) {
+    const caption = prompt('改一下配文：', it.caption || '');
+    if (caption === null) return;
+    const d = await albumPost('edit', it.id, { caption });
+    if (d && d.ok) loadAlbums();
+  }
+
+  // 指给她看：把服务器图片转成 dataUrl 发进聊天，配文作为文字
+  async function albumShow(it) {
+    try {
+      const resp = await fetch(BASE + '/img/' + it.hash);
+      const blob = await resp.blob();
+      const dataUrl = await new Promise((resolve) => {
+        const r = new FileReader();
+        r.onload = () => resolve(String(r.result));
+        r.onerror = () => resolve('');
+        r.readAsDataURL(blob);
+      });
+      if (!dataUrl) {
+        if (albumStatusEl) { albumStatusEl.textContent = '读取失败'; setTimeout(() => { albumStatusEl.textContent = ''; }, 1500); }
+        return;
+      }
+      pendingImages.push(dataUrl);
+      input.value = it.caption ? ('你看这张照片：' + it.caption) : '你看这张照片';
+      autosize();
+      send();
+    } catch { alert('读取失败'); }
+  }
+
+  if (albumUploadBtn) albumUploadBtn.addEventListener('click', () => albumFileEl && albumFileEl.click());
+  if (albumFileEl) albumFileEl.addEventListener('change', async () => {
+    const f = albumFileEl.files && albumFileEl.files[0];
+    albumFileEl.value = '';
+    if (!f) return;
+    const dataUrl = await compressImage(f);
+    if (!dataUrl) return;
+    const caption = prompt('给这张照片配句话（可留空）：');
+    if (caption === null) return;
+    const d = await albumPost('save', '', { dataUrl, caption });
+    if (d && d.ok) loadAlbums();
+  });
 
   // ---------- 便签纸 ----------
   // 第一步：纯文字便签，可新建/编辑/删除，服务端自动保存，电脑手机同步。
@@ -1979,6 +2109,8 @@
     if (list0.length) {
       b.classList.add('img-bubble');
       for (const im of list0) {
+        const wrap = document.createElement('div');
+        wrap.className = 'chat-img-wrap';
         const el = document.createElement('img');
         el.className = 'chat-img';
         el.loading = 'lazy';
@@ -1986,7 +2118,15 @@
         el.src = String(im).startsWith('data:') ? String(im) : BASE + '/img/' + im;
         el.addEventListener('load', keepBottom);
         el.addEventListener('error', keepBottom);
-        b.appendChild(el);
+        wrap.appendChild(el);
+        const saveBtn = document.createElement('button');
+        saveBtn.type = 'button';
+        saveBtn.className = 'chat-img-save';
+        saveBtn.textContent = '📷';
+        saveBtn.title = '收藏到相册';
+        saveBtn.addEventListener('click', () => saveToAlbum(im));
+        wrap.appendChild(saveBtn);
+        b.appendChild(wrap);
       }
       if (text) {
         const t = document.createElement('div');

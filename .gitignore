@@ -1,5 +1,4 @@
-# 运行数据：文本型记忆随 git 备份，图片/语音/运行时文件不传
-companion-plugin/data/images/
+# 运行数据：文本型记忆、相册照片随 git 备份；语音缓存/运行时文件不传
 companion-plugin/data/tts/
 companion-plugin/data/prompt.md
 companion-proxy/logs/

@@ -31,6 +31,7 @@ const IMAGES_URL = new URL('./images/', DATA_URL)
 const TTS_URL = new URL('./tts/', DATA_URL)
 const MEMOS_URL = new URL('./memos/', DATA_URL)
 const DRAWINGS_URL = new URL('./drawings/', DATA_URL)
+const ALBUMS_URL = new URL('./albums/', DATA_URL)
 const CHAT_BG_URL = new URL('chat-background.json', DATA_URL)
 // 同一句语音可能同时被预取和播放请求命中。把生成任务合并，避免
 // 蜂窝网络抖动时重复启动 edge-tts，重复任务会互相抢带宽并延迟出声。
@@ -226,6 +227,7 @@ function ensureDirs() {
   try { mkdirSync(THREADS_URL, { recursive: true }) } catch {}
   try { mkdirSync(MEMOS_URL, { recursive: true }) } catch {}
   try { mkdirSync(DRAWINGS_URL, { recursive: true }) } catch {}
+  try { mkdirSync(ALBUMS_URL, { recursive: true }) } catch {}
 }
 
 function safeId(id) {
@@ -611,6 +613,86 @@ async function drawingPost(req, res) {
   }
   writeJsonUrl(drawingUrl(id), drawing)
   return sendJson(res, 200, { ok: true, drawing })
+}
+
+// ---------- 相册：收藏珍贵图片 + 配文，共同回忆 ----------
+// 图片复用 images 目录（saveImage/imageFile 的 hash 存储），相册条目只存元数据。
+
+function albumUrl(id) {
+  return new URL(`${id}.json`, ALBUMS_URL)
+}
+
+function listAlbums() {
+  ensureDirs()
+  let names = []
+  try { names = readdirSync(ALBUMS_URL) } catch { return [] }
+  const out = []
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue
+    const data = readJsonUrl(new URL(name, ALBUMS_URL), null)
+    if (!data || !data.id || !data.hash) continue
+    out.push({
+      id: data.id,
+      hash: data.hash,
+      caption: String(data.caption || ''),
+      createdAt: data.createdAt || '',
+      updatedAt: data.updatedAt || '',
+    })
+  }
+  out.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
+  return out
+}
+
+async function albumPost(req, res) {
+  let body
+  try {
+    body = await readJson(req)
+  } catch {
+    return sendJson(res, 400, { error: 'bad json' })
+  }
+  const action = String(body && body.action || 'save')
+  if (action === 'delete') {
+    const id = safeId(body && body.id)
+    if (!id) return sendJson(res, 400, { error: 'bad id' })
+    try {
+      rmSync(albumUrl(id), { force: true })
+      return sendJson(res, 200, { ok: true, id })
+    } catch (error) {
+      return sendJson(res, 500, { error: String((error && error.message) || error).slice(0, 160) })
+    }
+  }
+  if (action === 'edit') {
+    const id = safeId(body && body.id)
+    if (!id) return sendJson(res, 400, { error: 'bad id' })
+    const existing = readJsonUrl(albumUrl(id), null)
+    if (!existing) return sendJson(res, 404, { error: 'album not found' })
+    const caption = String(body && body.caption || '').trim().slice(0, 2000)
+    const album = { ...existing, caption, updatedAt: new Date().toISOString() }
+    writeJsonUrl(albumUrl(id), album)
+    return sendJson(res, 200, { ok: true, album })
+  }
+  if (action !== 'save') return sendJson(res, 400, { error: 'bad action' })
+
+  ensureDirs()
+  // 图片来源：已是服务器上的 hash，或新传的 base64 dataUrl
+  let hash = String(body && body.hash || '').replace(/[^a-f0-9]/gi, '')
+  if (!hash && body && typeof body.dataUrl === 'string' && body.dataUrl.startsWith('data:image/')) {
+    hash = saveImage(body.dataUrl)
+  }
+  if (!hash || !imageFile(hash)) return sendJson(res, 400, { error: 'bad image' })
+
+  const id = safeId(body && body.id) || 'album-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6)
+  const existing = readJsonUrl(albumUrl(id), null)
+  const caption = String(body && body.caption || (existing && existing.caption) || '').trim().slice(0, 2000)
+  const album = {
+    id,
+    hash,
+    caption,
+    createdAt: String((body && body.createdAt) || (existing && existing.createdAt) || new Date().toISOString()),
+    updatedAt: new Date().toISOString(),
+  }
+  writeJsonUrl(albumUrl(id), album)
+  return sendJson(res, 200, { ok: true, album })
 }
 
 // 聊天背景：上传/清除（图片存 images 目录，记录 hash 供多设备同步）
@@ -2145,6 +2227,9 @@ async function serveGet(request) {
   if (path === `${BASE}/drawings`) {
     return jsonResponse({ drawings: listDrawings() })
   }
+  if (path === `${BASE}/albums`) {
+    return jsonResponse({ albums: listAlbums() })
+  }
   if (path === `${BASE}/chat-bg`) {
     const data = readJsonUrl(CHAT_BG_URL, null)
     const hash = data && typeof data.hash === 'string' ? data.hash : ''
@@ -2176,7 +2261,7 @@ export function apply(ctx) {
   ensureDirs()
   const disposers = []
   disposers.push(ctx.webServer.register({ kind: 'prefix', path: BASE, resource: serveGet }))
-  for (const name of ['chat', 'notes', 'save', 'model', 'mem-edit', 'episode-edit', 'archive-edit', 'game-move', 'game-over', 'memo', 'memo-write', 'drawing', 'draw-ai', 'chat-bg', 'xq-say', 'xq-over', 'facts']) {
+  for (const name of ['chat', 'notes', 'save', 'model', 'mem-edit', 'episode-edit', 'archive-edit', 'game-move', 'game-over', 'memo', 'memo-write', 'drawing', 'draw-ai', 'chat-bg', 'album', 'xq-say', 'xq-over', 'facts']) {
     disposers.push(
       ctx.webServer.register({
         kind: 'exact',
@@ -2211,6 +2296,7 @@ async function handlePost(ctx, name, req, res) {
   if (name === 'mem-edit') return memEdit(ctx, req, res)
   if (name === 'episode-edit') return episodeEdit(ctx, req, res)
   if (name === 'archive-edit') return archiveEdit(req, res)
+  if (name === 'album') return albumPost(req, res)
 }
 
 // ---------- 切换模型 ----------

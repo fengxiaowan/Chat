@@ -634,6 +634,27 @@ header {
 .locate-flash {
   animation: locate-flash 1.8s ease;
 }
+
+/* 重生成：骰子挂在我的消息下方，低调一点，像个顺手的小工具 */
+.regen-bar {
+  display: flex; align-items: center; gap: 5px;
+  margin: 2px 4px 0 0; justify-content: flex-end;
+}
+.regen-btn {
+  border: 0; background: transparent;
+  font-size: 14px; line-height: 1;
+  width: 22px; height: 22px; border-radius: 50%;
+  cursor: pointer; opacity: .38;
+  transition: opacity .15s ease, transform .15s ease;
+  padding: 0;
+}
+.regen-btn:hover { opacity: .85; transform: rotate(-12deg); }
+.regen-btn.busy { opacity: .9; animation: regen-spin 1s linear infinite; }
+@keyframes regen-spin { to { transform: rotate(360deg); } }
+.regen-count {
+  font-size: 10px; color: #a89b88;
+  font-variant-numeric: tabular-nums;
+}
 @keyframes locate-flash {
   0%, 40% { box-shadow: 0 0 0 3px rgba(255, 214, 74, 0.6); }
   100% { box-shadow: 0 0 0 3px transparent; }

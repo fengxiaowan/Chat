@@ -60,6 +60,7 @@
     hist: 'companion.history.v3',
     notes: 'companion.notes.v4',
     thread: 'companion.thread.v1',
+    dropped: 'companion.dropped.v1',
   };
   const EMPTY_NOTES = { about_you: [], how_to_talk: [], between_us: [], about_me: [] };
   // 本地缓存多少条：够翻一段历史，又不至于把 localStorage 撑爆
@@ -81,9 +82,28 @@
     wake: null,
     typing: null,
     notesBusy: false,
+    dropped: [],   // 被重生成替换掉的旧消息
   };
   let ctrl = null;
   let saveTimer = null;
+
+  // 重生成状态：只针对「最新一轮」，不碰更早的对话
+  // round = {
+  //   userTs:    我这句的时间戳（骰子按钮挂在它下面）
+  //   startIndex: 这一轮开始前 S.history 的长度（她说的都在这之后）
+  //   rejected:  已经被否掉的几版（每版 = 那一轮她的几句话拼起来的字符串）
+  //   attempt:    已经重生成过几次
+  //   busy:       正在重生成中
+  // }
+  const T = { round: null }
+
+  // 被重生成替换掉的旧消息（ts+内容），用来让服务器真正删掉它们。
+  // 只保留最近一小批，避免无限增长。
+  function droppedKeys() {
+    const set = new Set()
+    for (const d of (S.dropped || [])) set.add(String(d.ts) + '|' + String(d.content || ''))
+    return set
+  }
 
   function read(k, d) {
     try {
@@ -102,6 +122,22 @@
     return out;
   }
   // 两个设备各自的本地记录取并集，避免后保存的一方覆盖另一方
+  // 服务器「墓碑清单」：删过的消息，本地缓存里也不许再显示。
+  // 手机上删掉的东西，电脑浏览器还留着旧缓存时会看到——这是同一份本地缓存。
+  let serverDropped = new Set()
+  function setDropped(list) {
+    serverDropped = new Set()
+    const arr = Array.isArray(list) ? list : []
+    for (const x of arr) {
+      serverDropped.add(String(x.ts) + '|' + String(x.content || ''))
+    }
+    // 也存到本地：下次首屏能立刻过滤，不用等服务器
+    if (arr.length) write(LS.dropped, arr.slice(-200))
+  }
+  function withoutDropped(list) {
+    if (!serverDropped.size) return list
+    return (list || []).filter((m) => !serverDropped.has(String(m && m.ts) + '|' + String((m && m.content) || '')))
+  }
   function mergeMessages(server, local) {
     const seen = new Set();
     const out = [];
@@ -2226,9 +2262,9 @@
     if (qbtn) b.appendChild(qbtn);
     return row;
   }
-  function addBubble(role, text, img, meta) {
+  function addBubble(role, text, img, meta, ts) {
     hideTyping();
-    const row = makeBubble(role, text, img, meta);
+    const row = makeBubble(role, text, img, meta, ts);
     list.appendChild(row);
     scrollBottom();
     if (role === 'user') avatarState('listening');
@@ -2303,6 +2339,8 @@
       else scrollBottom();
     }
     updateUsage();
+    // 重画后骰子按钮会丢，补回来
+    try { renderRegenBtns() } catch {}
   }
 
   async function loadMore() {
@@ -2317,7 +2355,8 @@
       if (!r.ok) return;
       const d = await r.json();
       if (!d || !Array.isArray(d.messages)) return;
-      S.history = mergeMessages(d.messages, S.history);
+      setDropped(d.dropped)
+      S.history = withoutDropped(mergeMessages(d.messages, S.history));
       S.total = d.total || S.total;
       S.hasMore = !!d.hasMore;
       renderAll(true);
@@ -2348,7 +2387,13 @@
     try {
       const cur = await (await fetch(BASE + '/current')).json();
       if (cur && Array.isArray(cur.messages) && cur.threadId === S.threadId && cur.messages.length) {
-        S.history = mergeMessages(cur.messages, S.history);
+        // 重生成丢弃的版本不能被服务器合并回来
+        setDropped(cur.dropped)
+        const dropped = droppedKeys()
+        const keep = dropped.size
+          ? cur.messages.filter((m) => !dropped.has(String(m && m.ts) + '|' + String((m && m.content) || '')))
+          : cur.messages
+        S.history = withoutDropped(mergeMessages(keep, S.history));
       }
     } catch {}
     const payload = {
@@ -2358,6 +2403,9 @@
       messages: S.history,
       createdAt: S.createdAt || new Date().toISOString(),
     };
+    // 告诉服务器哪些已被替换，让它真正删掉
+    const dropped = S.dropped || []
+    if (dropped.length) payload.dropped = dropped.slice(-20)
     try {
       await fetch(BASE + '/save', {
         method: 'POST',
@@ -2393,7 +2441,12 @@
     while (true) {
       if (gen !== S.gen) return;
       if (S.idx >= S.queue.length) {
-        if (S.done) { hideTyping(); return; }
+        if (S.done) {
+          hideTyping()
+          // 这一轮的气泡全部吐完，停止累积
+          if (T.round) T.round.active = false
+          return
+        }
         await waitWake();
         continue;
       }
@@ -2403,6 +2456,9 @@
       const bubbleEl = addBubble('assistant', text);
       enqueueTts(text, bubbleEl);
       S.history.push({ role: 'assistant', content: text, ts: Date.now() });
+      // 记下「这一轮她目前说的话」，重生成时直接拿去当被否掉的版本
+      // 只有本轮真的在生成时才累积（加载历史/重放时不该混进来）
+      if (T.round && T.round.active) T.round.current = (T.round.current || '') + text
       scheduleSave();
       updateUsage();
       await sleep(150 + Math.random() * 220);
@@ -2505,16 +2561,18 @@
     const bubbleText = quoteText
       ? (text ? text : '')
       : text;
+    // 先定时间戳：DOM 用它标记（骰子按钮靠它定位），历史和气泡也用同一个值
+    const userTs = Date.now();
     if (images.length) {
-      addBubble('user', bubbleText, images, quoteText ? { quote: quoteText, quoteTs } : undefined);
+      addBubble('user', bubbleText, images, quoteText ? { quote: quoteText, quoteTs } : undefined, userTs);
     } else {
-      addBubble('user', bubbleText, undefined, quoteText ? { quote: quoteText, quoteTs } : undefined);
+      addBubble('user', bubbleText, undefined, quoteText ? { quote: quoteText, quoteTs } : undefined, userTs);
     }
     // 引用：content 存用户的文字，meta.quote 存被引用原文
     S.history.push({
       role: 'user',
       content: bubbleText || '（引用）',
-      ts: Date.now(),
+      ts: userTs,
       ...(quoteText ? { meta: { quote: quoteText, quoteTs } } : {}),
     });
     pendingImages = [];
@@ -2527,10 +2585,23 @@
     // 用户让她把讨论结果写上去：聊天照常回复，之后自动触发写便签
     const askWrite = /写(?:上去|进|到|在)(?:便签|纸上?)?|写到纸上|写上去|记(?:下来|到)(?:便签|纸上?)?|落到(?:便签|纸上?)?/.test(text);
     if (askWrite && M.currentId) M.pendingWrite = text;
+    // 记下这一轮从哪条开始：重生成时要把这之后她说的删掉
+    T.round = {
+      userTs: S.history[S.history.length - 1].ts,
+      startIndex: S.history.length,
+      rejected: [],
+      current: '',
+      active: true,
+      attempt: 0,
+      busy: false,
+      text: bubbleText,
+      images,
+    }
+    renderRegenBtns()
     runTurn(bubbleText, false, images);
   }
 
-  async function runTurn(text, isRetry, images) {
+  async function runTurn(text, isRetry, images, opts = {}) {
     const gen = ++S.gen;
     if (ctrl) ctrl.abort();
     ctrl = new AbortController();
@@ -2563,6 +2634,10 @@
     try {
       // 只发最近 S.limit 条（后端 historyTurns 也按这个数切），省上行带宽、更快拿到首字节
       const payload = { notes: S.notes, messages: S.history.slice(-S.limit), tts: autoPlay };
+      // 重生成：把刚才被否掉的几版带过去，让她知道这版没接住
+      if (opts && Array.isArray(opts.rejected) && opts.rejected.length) {
+        payload.rejected = opts.rejected;
+      }
       // 只在棋局进行中、且当前正开着棋类侧栏时才带上棋局，避免她凭空催人下棋
       const activeMode = localStorage.getItem('companion.panelMode.v1') || 'game';
       const gomokuOrTic = activeMode === 'game' || activeMode === 'gomoku';
@@ -2669,7 +2744,9 @@
           addBubble('assistant', '刚才那下没接上话，你再说一句？');
         }
       }
-      if (got > 0 && gen === S.gen) {
+      // 重生成期间不提取记忆：只有用户最终留下的那一版才配进记忆。
+      // 每点一次骰子就跑一遍 notes，会把丢弃的版本也吸进去。
+      if (got > 0 && gen === S.gen && !(opts && opts.regen)) {
         S.notesTick = (S.notesTick || 0) + 1;
         if (S.notesTick % 5 === 0) updateNotes();
       }
@@ -2679,6 +2756,100 @@
         M.pendingWrite = '';
         askMemoWrite(instr);
       }
+    }
+  }
+
+  // ---------- 重生成最新一轮 ----------
+  // 骰子按钮挂在我最新那条消息下面。只重生成这一轮她的回复；
+  // 被否掉的几版会传给后端，让她知道"这版没接住"，从而更收一点。
+  // 用「我这句」的时间戳实时定位，而不是记死的下标——
+  // 下标会随着她每次追加回复而漂移，第二次重生成就会切错范围。
+  function myMsgIndex(r) {
+    if (!r) return -1
+    for (let i = S.history.length - 1; i >= 0; i--) {
+      const m = S.history[i]
+      if (m && m.role === 'user' && String(m.ts) === String(r.userTs)) return i
+    }
+    return -1
+  }
+  // 这一轮她说的话 = 我这条之后的所有 assistant 消息
+  function currentRoundLines() {
+    const r = T.round
+    const i = myMsgIndex(r)
+    if (i < 0) return []
+    return S.history.slice(i + 1).filter((m) => m.role === 'assistant').map((m) => m.content)
+  }
+
+  function renderRegenBtns() {
+    // 先清掉所有旧的骰子按钮和计数
+    list.querySelectorAll('.regen-bar').forEach((n) => n.remove())
+    const r = T.round
+    if (!r) return
+    // 找到我最新那条消息对应的 DOM 行（用 ts 定位）
+    const row = list.querySelector(`.row[data-ts="${CSS.escape(String(r.userTs))}"]`)
+    if (!row) return
+    const bar = document.createElement('div')
+    bar.className = 'regen-bar'
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.className = 'regen-btn'
+    btn.title = '让她重新说这一轮'
+    btn.textContent = '🎲'
+    if (r.busy) btn.classList.add('busy')
+    if (r.attempt > 0) {
+      const cnt = document.createElement('span')
+      cnt.className = 'regen-count'
+      cnt.textContent = String(r.attempt)
+      bar.appendChild(btn)
+      bar.appendChild(cnt)
+    } else {
+      bar.appendChild(btn)
+    }
+    btn.addEventListener('click', regenerateTurn)
+    row.appendChild(bar)
+  }
+
+  async function regenerateTurn() {
+    const r = T.round
+    if (!r || r.busy) return
+    const myIdx = myMsgIndex(r)
+    if (myIdx < 0) {
+      showError('找不到这条消息了，没法重来。')
+      return
+    }
+    // 只允许重生成最新一轮：我这条之后只能有 assistant 消息，不能有更新的 user 消息
+    const after = S.history.slice(myIdx + 1)
+    if (after.some((m) => m && m.role === 'user')) {
+      showError('这一轮已经不是最新的了，没法重来。')
+      return
+    }
+
+    // 1. 把这一轮她的回复记为「被否掉」
+    const rejectedText = (r.current || '').trim() || currentRoundLines().join('')
+    if (rejectedText) r.rejected.push(rejectedText)
+    if (r.rejected.length > 3) r.rejected = r.rejected.slice(-3)
+    r.current = ''   // 这一版已经记下了，开始累积新版
+
+    // 2. 从界面和历史里撤掉这一轮她的消息（不撤我这句）
+    //    同时记下它们，等会儿落盘时让服务器真正删掉（否则并集会把旧版留下）
+    const removed = S.history.slice(myIdx + 1).filter((m) => m && m.role === 'assistant')
+    for (const m of removed) {
+      S.dropped.push({ ts: m.ts, content: m.content })
+    }
+    if (S.dropped.length > 40) S.dropped = S.dropped.slice(-40)
+    S.history = S.history.slice(0, myIdx + 1)
+    renderAll()
+
+    r.attempt += 1
+    r.busy = true
+    r.active = true
+    r.current = ''
+    renderRegenBtns()
+    try {
+      await runTurn(r.text, false, r.images, { rejected: r.rejected, regen: true })
+    } finally {
+      r.busy = false
+      renderRegenBtns()
     }
   }
 
@@ -2763,7 +2934,8 @@
       const cur = await (await fetch(BASE + '/current?limit=300', { cache: 'no-store' })).json();
       if (!cur || !Array.isArray(cur.messages) || !cur.messages.length) return;
       if (cur.threadId && cur.threadId !== S.threadId) return;
-      const merged = mergeMessages(cur.messages, S.history);
+      setDropped(cur.dropped)
+      const merged = withoutDropped(mergeMessages(cur.messages, S.history));
       if (merged.length === S.history.length) return; // 没变化，别重绘
       S.history = merged.length > CACHE_MAX ? merged.slice(-CACHE_MAX) : merged;
       S.total = cur.total || S.history.length;
@@ -3035,6 +3207,7 @@
     if (ctrl) ctrl.abort();
     S.queue = []; S.idx = 0; S.done = true;
     S.history = [];
+    T.round = null;   // 新对话：重生成状态一并清掉
     S.threadId = newId();
     S.title = '';
     S.createdAt = new Date().toISOString();
@@ -3699,6 +3872,7 @@
     S.gen += 1;
     if (ctrl) ctrl.abort();
     S.history = [];
+    T.round = null;
     S.notes = normalizeNotes(EMPTY_NOTES);
     S.threadId = newId();
     S.title = '';
@@ -3747,6 +3921,9 @@
     // 干等着就是那个「空白聊天窗口」。
     const localHist = read(LS.hist, []);
     const localThread = read(LS.thread, '');    S.history = Array.isArray(localHist) ? localHist : [];
+    // 先用上次记下的墓碑过滤一遍，避免删掉的消息在首屏闪一下
+    setDropped(read(LS.dropped, []));
+    S.history = withoutDropped(S.history);
     S.total = S.history.length;
     S.hasMore = false;
     S.notes = normalizeNotes(read(LS.notes, EMPTY_NOTES));
@@ -3785,7 +3962,9 @@
 
       if (remoteOk) {
         // 合并服务器和本地（并集），两边都不丢
-        const merged = mergeMessages(remote.messages, localHist);
+        // 但先应用墓碑：手机上删掉的，电脑本地缓存里也不能再显示
+        setDropped(remote.dropped)
+        const merged = withoutDropped(mergeMessages(remote.messages, localHist));
         S.history = merged.length > CACHE_MAX ? merged.slice(-CACHE_MAX) : merged;
         S.total = remote.total || S.history.length;
         S.hasMore = !!remote.hasMore;

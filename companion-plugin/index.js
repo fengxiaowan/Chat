@@ -1000,11 +1000,27 @@ function saveThread(body) {
   ensureDirs()
   // 存档剔除游戏心声：短期接话靠前端会话内 history，长期存档不落棋局细节
   const incoming = normRealMessages(body && body.messages)
+  // 重生成：被否掉的那几版要真正从存档里删掉，否则并集会把它们留下来。
+  // 前端把它们的 ts 报上来，这里按 ts + 内容精确剔除。
+  const dropped = (Array.isArray(body && body.dropped) ? body.dropped : [])
+    .map((x) => ({ ts: x && x.ts, content: String((x && x.content) || '') }))
+    .filter((x) => x.ts)
   const threadId = safeId(body && body.threadId) || 'thread-' + Date.now()
   const existing = readJsonUrl(threadUrl(threadId), null)
-  const existingMessages = (existing && Array.isArray(existing.messages)) ? existing.messages : []
+  let existingMessages = (existing && Array.isArray(existing.messages)) ? existing.messages : []
+  if (dropped.length) {
+    const keys = new Set(dropped.map((d) => String(d.ts) + '|' + d.content))
+    existingMessages = existingMessages.filter((m) => !keys.has(String(m && m.ts) + '|' + String((m && m.content) || '')))
+  }
   // 服务器端合并：保留已有 + 追加新消息，后保存的一方不会再覆盖另一方
-  const merged = mergeByKey(existingMessages, incoming)
+  // 但「删过的」必须持久化删除：否则另一台设备（或本地缓存）再一合并就又回来了。
+  // 所以把删除记录存进一个墓碑列表，每次合并前先剔除。
+  const tombstones = Array.isArray(existing && existing.dropped)
+    ? existing.dropped.slice()
+    : []
+  const tombKeys = new Set(tombstones.map((d) => String(d.ts) + '|' + String(d.content || '')))
+  const incomingClean = incoming.filter((m) => !tombKeys.has(String(m && m.ts) + '|' + String((m && m.content) || '')))
+  const merged = mergeByKey(existingMessages, incomingClean)
   // 空对话不落盘，避免归档里堆一堆 0 条的
   if (!merged.length) {
     return {
@@ -1021,6 +1037,8 @@ function saveThread(body) {
     title: String((body && body.title) || (existing && existing.title) || '').slice(0, 40) || '未命名',
     notes: cleanNotes(body && body.notes),
     messages: merged,
+    // 墓碑清单：被删掉的消息，永远不许再合并回来。只留最近 200 条。
+    dropped: [...tombstones, ...dropped].slice(-200),
     createdAt: String((body && body.createdAt) || (existing && existing.createdAt) || new Date().toISOString()),
     updatedAt: new Date().toISOString(),
   }
@@ -1082,6 +1100,8 @@ function cleanBubble(raw) {
   s = s.replace(/[ \t]+/g, ' ').trim()
   s = s.replace(/[。，,；;、：:]+$/, '').trim()
   if (s === '嗯') s = '嗯嗯'
+  // 罗马音猫叫语音念出来很怪（"nya" 会被读成英文/奇怪音），统一换成「喵」
+  s = s.replace(/nya+a*~*/gi, '喵').replace(/\s{2,}/g, ' ').trim()
   return s
 }
 
@@ -2647,6 +2667,22 @@ async function save(ctx, req, res) {
 
 // ---------- 聊天 ----------
 
+// 重生成提示：把被否掉的几版喂给模型，让它「知道被重选过」而不是凭空重演。
+// 关键：不是让它道歉、解释、或复盘自己的回答（那样很出戏），
+// 只让它悄悄收紧一点：少追问、别重复刚才的毛病、更贴着对方最后那句话。
+function rejectedHint(rejected) {
+  if (!Array.isArray(rejected) || !rejected.length) return ''
+  const lines = rejected.map((s, i) => `${i + 1}. ${s}`).join('\n')
+  return `\n\n【对方把你上一版退回来了，让你重新说一次】\n上一版是：\n${lines}\n\n` +
+    `这次别只是换个说法交差，也别一味变短变保守——对方退回来说明那一版没说到点子上。\n` +
+    `请重新看一眼对方最后那句话里真正值得回应的东西：\n` +
+    `· 如果上一版只是在附和、打趣、或者绕开了重点，这次就说点更实的。\n` +
+    `· 如果上一版抛了个不痛不痒的问题，这次可以不给问题，给一个真正有分量的判断。\n` +
+    `· 去找对方那句话里还没被接住的那一层——他真正在意的，或者话里藏着的意思。\n` +
+    `· 别重复上一版用过的说法和比喻，也别提「刚才那版」「我重新说」，像第一次开口一样自然。\n` +
+    `目标是这一版比上一版更值得听，不是更安全。`
+}
+
 async function chat(ctx, req, res) {
   let body
   try {
@@ -2661,6 +2697,13 @@ async function chat(ctx, req, res) {
   // 前端开了自动朗读才预热语音：流式吐字的同时把 edge-tts 生成跑起来，
   // 等前端来取 /tts 时多半已经生成好，只剩下载，手机流量下省掉生成等待。
   const wantTts = !!(body && body.tts)
+  // 重生成：用户把刚才那几版被否掉的回复发上来。让她知道自己被重选过，
+  // 于是新的尝试更收、更审视，而不是装作什么都没发生重演一遍。
+  const rejected = (Array.isArray(body && body.rejected) ? body.rejected : [])
+    .map((s) => String(s || '').trim())
+    .filter(Boolean)
+    .slice(-3)
+    .map((s) => s.slice(0, 600))
   // 微信式引用：从最后一条用户消息的 meta.quote 提取被引用的原文
   // 注意：引用可能是单独一条消息，附话是下一条，所以要找最近一条带 meta.quote 的 user 消息
   const quotedMsg = [...normMessages(body && body.messages)].reverse().find((m) => m.role === 'user' && m.meta && typeof m.meta.quote === 'string')
@@ -2838,7 +2881,8 @@ async function chat(ctx, req, res) {
             + (digestText ? '\n\n【你已经想起来的这段记忆，直接用这个口吻说，别再说「记不清」】\n' + digestText : '')
             + (gameBlock(game) ? '\n\n' + gameBlock(game) : '\n\n【关于棋局】如果对方提到下棋、复盘或这局怎么下的，你现在手上没有具体棋局面，直接说记不清或不知道，绝不许自己编造棋盘或结果。')
             + (memoBlock(memo) ? '\n\n' + memoBlock(memo) : '')
-            + (quoteContextText ? '\n\n【对方引用了一句你们之前说过的话】\n' + quoteContextText + '\n\n请结合这段话接话，不用再翻更多，找到答案就停。' : ''),
+            + (quoteContextText ? '\n\n【对方引用了一句你们之前说过的话】\n' + quoteContextText + '\n\n请结合这段话接话，不用再翻更多，找到答案就停。' : '')
+            + rejectedHint(rejected),
           messages: [{ role: 'user', content: userContent }],
           temperature: cfg.temperature,
           maxTokens: cfg.maxTokens,

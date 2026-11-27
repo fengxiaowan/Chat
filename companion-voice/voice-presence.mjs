@@ -1,6 +1,8 @@
-// 小喵 · 桌面语音常驻（唤醒词版）
+// 小喵 · 桌面语音常驻（通话模式）
 //
-// 在后台常驻，不用开网页窗口。说「老婆」唤醒，说完自动识别、发给小喵、用她平时那个声音读出来。
+// 平时【完全不监听麦克风】，你看剧、放歌、玩游戏都不会误触发。
+// 按一下热键（默认 Ctrl+F1）进入「通话模式」，此后才听「老婆」这个唤醒词；
+// 再按一次热键退出通话模式，麦克风立刻关掉。
 //
 // 组成：
 //   - too-voice.exe：本机语音引擎，负责唤醒词 + 语音识别（WASAPI 直接抓麦克风，不受浏览器限制）
@@ -8,13 +10,48 @@
 //   - edge-tts（/liao/tts）：和网页完全同一个声音
 //
 // 用法：node voice-presence.mjs
-// 退出：Ctrl+C
+//   热键 Ctrl+F1：开关通话模式（也可以用热键文件唤它）
+//   退出：Ctrl+C
 
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { tmpdir } from 'node:os'
+import { openSync, writeSync, closeSync } from 'node:fs'
+
+// ---------- 单实例锁：防止重复启动多个实例抢麦克风 ----------
+const LOCK_FILE = join(tmpdir(), 'xiaomiao-voice', 'presence.lock')
+try { mkdirSync(join(tmpdir(), 'xiaomiao-voice'), { recursive: true }) } catch {}
+try {
+  const fd = openSync(LOCK_FILE, 'wx') // 已存在则抛错
+  writeSync(fd, String(process.pid))
+  closeSync(fd)
+} catch {
+  // 锁已存在：检查那个进程还活着吗
+  let alive = false
+  try {
+    const pid = Number(readFileSync(LOCK_FILE, 'utf8').trim())
+    if (pid && pid !== process.pid) {
+      process.kill(pid, 0) // 抛错说明进程不存在
+      alive = true
+    }
+  } catch { alive = false }
+  if (alive) {
+    console.error('已有一个语音服务在运行，本实例退出。')
+    process.exit(0)
+  }
+  // 残留锁：覆盖
+  try { writeFileSync(LOCK_FILE, String(process.pid)) } catch {}
+}
+
+function releaseLock() {
+  try {
+    const pid = Number(readFileSync(LOCK_FILE, 'utf8').trim())
+    if (pid === process.pid) rmSync(LOCK_FILE, { force: true })
+  } catch {}
+}
+process.on('exit', releaseLock)
 
 // ---------- 配置 ----------
 const cfg = {
@@ -29,6 +66,8 @@ const cfg = {
   // 状态文件：给悬浮小球读取，让你随时看到她在干嘛
   stateFile: join(tmpdir(), 'xiaomiao-voice', 'state.json'),
   logFile: join(tmpdir(), 'xiaomiao-voice', 'presence.log'),
+  // 总开关：由托盘菜单控制，关掉时连语音引擎都不启动，麦克风完全不占用
+  masterFile: join(tmpdir(), 'xiaomiao-voice', 'master.json'),
   // 安全阈值：暂停超过这个时间就强制恢复，避免卡死在「听不见」的状态
   maxPauseMs: 20000,
 }
@@ -46,8 +85,9 @@ function log(...a) {
 }
 
 // ---------- 状态上报 ----------
-// idle（睡着的，等唤醒词）/ hearing（在听你说）/ thinking（在想）/ speaking（在说）/ error
-let currentState = 'idle'
+// off（通话模式关，不监听）/ ready（通话模式开，等唤醒词）/ hearing（在听你说）
+// thinking（在想）/ speaking（在说）/ error
+let currentState = 'off'
 function setState(state) {
   if (currentState === state) return
   currentState = state
@@ -56,43 +96,79 @@ function setState(state) {
   } catch {}
 }
 
-// ---------- 语音引擎 ----------
-const child = spawn(cfg.engine, [
-  '--root', cfg.engineRoot,
-  '--models', cfg.engineModels,
-  '--bundled', cfg.engineBundled,
-], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
-child.stdin.setDefaultEncoding('utf8')
-
+// ---------- 语音引擎（可随时启停） ----------
+let child = null
 const pending = new Map()
 const eventHandlers = new Map()
 let seq = 0
 let engineReady = false
 
-createInterface({ input: child.stdout }).on('line', (line) => {
-  if (!line.trim()) return
-  let o
-  try { o = JSON.parse(line) } catch { return }
-  if (o.ready) { engineReady = true; return }
-  if (o.event) {
-    for (const cb of eventHandlers.get(o.event) || []) cb(o)
-    return
+// 引擎总开关：关掉时进程直接退出，麦克风与模型内存都释放
+let engineEnabled = false
+let engineRestartTimer = null
+
+function startEngine() {
+  if (engineEnabled || child) return
+  engineEnabled = true
+  engineReady = false
+  child = spawn(cfg.engine, [
+    '--root', cfg.engineRoot,
+    '--models', cfg.engineModels,
+    '--bundled', cfg.engineBundled,
+  ], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
+  child.stdin.setDefaultEncoding('utf8')
+
+  createInterface({ input: child.stdout }).on('line', (line) => {
+    if (!line.trim()) return
+    let o
+    try { o = JSON.parse(line) } catch { return }
+    if (o.ready) {
+      engineReady = true
+      onEngineReady()
+      return
+    }
+    if (o.event) {
+      for (const cb of eventHandlers.get(o.event) || []) cb(o)
+      return
+    }
+    if (o.id && pending.has(o.id)) {
+      const p = pending.get(o.id); pending.delete(o.id)
+      if (o.ok === false) p.reject(new Error(o.error || '引擎失败')); else p.resolve(o)
+    }
+  })
+  child.stderr.on('data', (b) => {
+    const s = b.toString('utf8').trim()
+    if (s && !/^\d\d:\d\d:\d\d\s*$/.test(s)) log('引擎:', s.slice(0, 200))
+  })
+  child.on('exit', (code) => {
+    child = null
+    engineReady = false
+    for (const p of pending.values()) p.reject(new Error('引擎已停止'))
+    pending.clear()
+    if (!engineEnabled) { log('语音引擎已停止（功能关闭）'); return }
+    log(`引擎异常退出（code=${code}），3 秒后重启`)
+    clearTimeout(engineRestartTimer)
+    engineRestartTimer = setTimeout(() => { if (engineEnabled) startEngine() }, 3000)
+  })
+}
+
+function stopEngine() {
+  engineEnabled = false
+  engineReady = false
+  clearTimeout(engineRestartTimer)
+  callMode = false
+  clearTimeout(callModeTimer)
+  if (child) {
+    try { child.kill() } catch {}
+    child = null
   }
-  if (o.id && pending.has(o.id)) {
-    const p = pending.get(o.id); pending.delete(o.id)
-    if (o.ok === false) p.reject(new Error(o.error || '引擎失败')); else p.resolve(o)
-  }
-})
-child.stderr.on('data', (b) => {
-  const s = b.toString('utf8').trim()
-  if (s && !/^\d\d:\d\d:\d\d\s*$/.test(s)) log('引擎:', s.slice(0, 200))
-})
-child.on('exit', (code) => {
-  log(`引擎退出（code=${code}），3 秒后重启`)
-  setTimeout(() => startListening(), 3000)
-})
+  for (const p of pending.values()) p.reject(new Error('引擎已停止'))
+  pending.clear()
+  setState('off')
+}
 
 function send(op, extra = {}) {
+  if (!child) return Promise.reject(new Error('语音引擎未启动'))
   const id = 'r' + ++seq
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve, reject })
@@ -213,7 +289,7 @@ async function speak(text) {
     // 只有「当前这一轮」才恢复监听：被打断时由打断方接管，避免互相覆盖
     if (token === playToken) {
       await setPaused(false)
-      setState('idle')
+      setState(callMode ? 'ready' : 'off')
     }
   }
 }
@@ -242,6 +318,7 @@ async function handleUtterance(text) {
   if (busy) { log('还在处理上一句，忽略：', text); return }
   const cleaned = sanitizeHeard(text)
   if (!cleaned) { log('识别结果清洗后为空，忽略：', text); return }
+  clearTimeout(wakeTimer)
   text = cleaned
   busy = true
   try {
@@ -255,26 +332,71 @@ async function handleUtterance(text) {
     setState('error')
   } finally {
     busy = false
-    // 只有没被打断才回到空闲；被打断时新一轮已经接管状态
-    if (!busy && currentState === 'error') setTimeout(() => { if (!busy) setState('idle') }, 1200)
-    else if (!busy) setState('idle')
+    // 说完回到「通话模式的待命」状态（不是完全关掉）
+    if (!busy) setState(callMode ? 'ready' : 'off')
   }
 }
 
-// ---------- 启动监听 ----------
-async function startListening() {
+// ---------- 通话模式（核心） ----------
+// 默认关。只有按了热键，才打开麦克风监听唤醒词；再按一下关掉。
+// 关掉时引擎完全不碰麦克风，所以看剧/听歌绝不会误唤醒。
+let callMode = false
+let callModeSince = 0
+let callModeTimer = null
+let wakeTimer = null
+
+// 通话模式最长自动保持时间（防止忘了关，一直占着麦克风）
+const CALL_MODE_MAX_MS = 10 * 60 * 1000
+
+async function enterCallMode() {
+  if (callMode) return
+  if (!child) { log('语音功能已关闭，先到托盘开启'); return }
+  callMode = true
+  callModeSince = Date.now()
   try {
     await send('listen', { wake: true, wakeWords: [cfg.wakeWord] })
-    log(`已就绪。说「${cfg.wakeWord}」唤醒她。`)
+    log(`📞 通话模式已开启。说「${cfg.wakeWord}」叫她；再按一次热键关闭。`)
+    setState('ready')
+    // 到时间自动退出，避免一直开着麦克风
+    clearTimeout(callModeTimer)
+    callModeTimer = setTimeout(() => {
+      log('通话模式到时，自动关闭')
+      exitCallMode()
+    }, CALL_MODE_MAX_MS)
   } catch (e) {
-    log('启动监听失败：', e.message, '（5 秒后重试）')
-    setTimeout(() => startListening(), 5000)
+    callMode = false
+    log('开启通话模式失败：', e.message)
+    setState('error')
   }
+}
+
+async function exitCallMode() {
+  if (!callMode) return
+  callMode = false
+  clearTimeout(callModeTimer)
+  callModeTimer = null
+  stopPlayback()
+  busy = false
+  try { await send('stop-listening') } catch (e) { log('关闭监听失败：', e.message) }
+  paused = false
+  log('📴 通话模式已关闭，不再监听麦克风。')
+  setState('off')
+}
+
+async function toggleCallMode() {
+  if (callMode) await exitCallMode()
+  else await enterCallMode()
 }
 
 // 被唤醒：如果你是在她说话/思考时喊她，应当「打断」并立刻开始听你说
 on('wake', (e) => {
   log(`被唤醒（${e.keyword}）`)
+  if (!callMode) return
+  clearTimeout(callModeTimer)
+  callModeTimer = setTimeout(() => {
+    log('通话模式到时，自动关闭')
+    exitCallMode()
+  }, CALL_MODE_MAX_MS)
   if (busy || paused) {
     log('打断当前回合，重新开始听')
     stopPlayback()
@@ -282,28 +404,72 @@ on('wake', (e) => {
     setPaused(false)
     setState('hearing')
   }
+
+  // 唤醒后 8 秒内如果没听到真正的语音内容，就回到待命。
+  // 这样环境音（剧里喊"老婆"）唤醒了也不会一直占着、反复空转。
+  clearTimeout(wakeTimer)
+  wakeTimer = setTimeout(() => {
+    if (callMode && !busy) {
+      log('唤醒后没有听到内容，回到待命')
+      setState('ready')
+    }
+  }, 8000)
 })
 on('utterance', (e) => { handleUtterance(e.text) })
 on('error', (e) => log('引擎报错：', e.message))
 
-// 引擎状态同步到状态文件，供悬浮球显示。
-// 注意只采纳「空闲/在听」，因为我们自己的 thinking / speaking 比引擎的更准确。
 on('state', (e) => {
-  if (busy) return
+  if (busy || !callMode) return
   if (e.state === 'hearing') setState('hearing')
-  else if (e.state === 'sleeping' || e.state === 'awake' || e.state === 'off') setState('idle')
+  else if (e.state === 'sleeping' || e.state === 'awake') setState('ready')
 })
 
-const waitReady = setInterval(() => {
-  if (engineReady) {
-    clearInterval(waitReady)
-    startListening()
+function onEngineReady() {
+  currentState = '' // 强制写一次，避免沿用上次残留的状态文件
+  setState('off')
+  log('语音引擎已就绪（未监听麦克风）。按 Ctrl+F1 进入通话模式。')
+}
+
+// ---------- 总开关轮询 ----------
+// 托盘菜单写 master.json。关掉时：退出通话 → 杀引擎 → 释放麦克风和内存。
+function readMaster() {
+  try {
+    if (!existsSync(cfg.masterFile)) return true // 默认开启
+    const j = JSON.parse(readFileSync(cfg.masterFile, 'utf8'))
+    return j.enabled !== false
+  } catch { return true }
+}
+let masterOn = false
+setInterval(() => {
+  const want = readMaster()
+  if (want === masterOn) return
+  masterOn = want
+  if (want) {
+    log('▶️ 语音功能开启')
+    startEngine()
+  } else {
+    log('⏹️ 语音功能关闭（释放麦克风）')
+    stopEngine()
   }
-}, 200)
+}, 400)
+
+// ---------- 热键监听（通过文件信号，由 PowerShell 写入） ----------
+// hotkey.ps1 注册全局热键，按下时把信号写进 hotkey.signal，这里轮询消费。
+const HOTKEY_SIGNAL = join(tmpdir(), 'xiaomiao-voice', 'hotkey.signal')
+let lastSignal = ''
+setInterval(() => {
+  if (!existsSync(HOTKEY_SIGNAL)) return
+  let s = ''
+  try { s = readFileSync(HOTKEY_SIGNAL, 'utf8').trim() } catch { return }
+  if (!s || s === lastSignal) return
+  lastSignal = s
+  log('收到热键信号')
+  toggleCallMode()
+}, 300)
 
 process.on('SIGINT', () => {
   log('收到 Ctrl+C，退出')
   stopPlayback()
-  try { child.stdin.end() } catch {}
-  setTimeout(() => { try { child.kill() } catch {} process.exit(0) }, 500)
+  try { child && child.stdin.end() } catch {}
+  setTimeout(() => { try { child && child.kill() } catch {} process.exit(0) }, 500)
 })

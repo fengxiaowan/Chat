@@ -954,10 +954,22 @@ function listThreads() {
 
 // ---------- 切气泡 ----------
 
+// 用户不喜欢黄豆脸 emoji，而且华为手机上有些新 emoji 显示成方块。
+// prompt 里已经要求不用，但模型偶尔仍会冒出来，这里做最后一道硬过滤。
+// 包括：黄豆脸（😅🤣😂😭🙃😬等）+ 华为易缺字的新 emoji（🥲🫠🥹🫡🪿等）。
+const BLOCKED_EMOJI = /[\u{1F600}-\u{1F64F}\u{1F900}-\u{1F9FF}\u{1FA70}-\u{1FAFF}\u{1F300}-\u{1F5FF}\u{2600}-\u{27BF}\u{1F1E6}-\u{1F1FF}]/gu
+// 可爱的颜文字里常见的符号（ω・∀≧≦°º✧♡☆等）要保留，别误删。
+const KEEP_KAOMOJI = /[\u00B0\u00BA\u30FB\uFF65\u2200\u2266\u2267\uFF5E~\u2661\u2665\u266A\u266B\u2606\u2605\u263A\u263B\u2665\u2661\u2736\u273F\uFF9E\uFF9F]/u
+
+function stripBlockedEmoji(s) {
+  return s.replace(BLOCKED_EMOJI, (m) => (KEEP_KAOMOJI.test(m) ? m : ''))
+}
+
 function cleanBubble(raw) {
   let s = String(raw || '')
   s = s.replace(/^\s*(?:[-*•·—]|\d+[.、)])\s+/, '')
   s = s.replace(/\*\*|`|#/g, '')
+  s = stripBlockedEmoji(s)
   s = s.replace(/[ \t]+/g, ' ').trim()
   s = s.replace(/[。，,；;、：:]+$/, '').trim()
   if (s === '嗯') s = '嗯嗯'

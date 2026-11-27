@@ -49,6 +49,8 @@ public class OrbForm : Form {
 
     private Color GetColor() {
         switch (state) {
+            case "off": return Color.FromArgb(90, 140, 140, 140);
+            case "ready": return Color.FromArgb(210, 70, 140, 235);
             case "hearing": return Color.FromArgb(230, 70, 160, 235);
             case "thinking": return Color.FromArgb(230, 235, 160, 70);
             case "speaking": return Color.FromArgb(230, 90, 200, 110);
@@ -64,7 +66,7 @@ public class OrbForm : Form {
         int pad = 3;
         using (var b = new SolidBrush(c))
             g.FillEllipse(b, pad, pad, size - pad * 2, size - pad * 2);
-        if (state != "idle") {
+        if (state != "idle" && state != "off") {
             using (var pen = new Pen(Color.FromArgb(90, c), 2))
                 g.DrawEllipse(pen, pad - 1, pad - 1, size - pad * 2 + 2, size - pad * 2 + 2);
         }

@@ -508,12 +508,14 @@
     const drawShell = $('draw-shell');
     const xiangqiShell = $('xiangqi-shell');
     const albumShell = $('album-shell');
+    const mapShell = $('map-shell');
     if (avatarShell) avatarShell.hidden = mode !== 'avatar';
     if (gameShell) gameShell.hidden = mode !== 'game' && mode !== 'gomoku';
     if (memoShell) memoShell.hidden = mode !== 'memo';
     if (drawShell) drawShell.hidden = mode !== 'draw';
     if (xiangqiShell) xiangqiShell.hidden = mode !== 'xiangqi';
     if (albumShell) albumShell.hidden = mode !== 'album';
+    if (mapShell) mapShell.hidden = mode !== 'map';
     if (mode === 'avatar') return;
     if (mode === 'memo') {
       localStorage.setItem('companion.panelMode.v1', mode);
@@ -533,6 +535,11 @@
     if (mode === 'album') {
       localStorage.setItem('companion.panelMode.v1', mode);
       loadAlbums();
+      return;
+    }
+    if (mode === 'map') {
+      localStorage.setItem('companion.panelMode.v1', mode);
+      try { window.WalkMap && window.WalkMap.activate() } catch {}
       return;
     }
     const kind = mode === 'gomoku' ? 'gomoku' : 'tictactoe';
@@ -558,23 +565,63 @@
     }
     localStorage.setItem('companion.panelMode.v1', mode);
   }
-  document.querySelectorAll('.mode-tab').forEach((tab) => {
+  // ---------- 模块切换 + 收纳 ----------
+  // 「⋯」里是不常用的模块。用收纳后，主栏只留常用的几个，手机不必横滑。
+  const moreBtn = $('mode-more-btn');
+  const moreMenu = $('mode-more-menu');
+  function closeMore() {
+    if (moreMenu) moreMenu.hidden = true
+    if (moreBtn) moreBtn.classList.remove('open')
+  }
+  function toggleMore(e) {
+    if (e) e.stopPropagation()
+    if (!moreMenu) return
+    const open = moreMenu.hidden
+    moreMenu.hidden = !open
+    if (moreBtn) moreBtn.classList.toggle('open', open)
+  }
+  if (moreBtn) moreBtn.addEventListener('click', toggleMore)
+  // 点别处关掉菜单
+  document.addEventListener('click', (e) => {
+    if (!moreMenu || moreMenu.hidden) return
+    if (moreMenu.contains(e.target) || e.target === moreBtn) return
+    closeMore()
+  })
+
+  // 统一的激活逻辑：主 tab 与收纳项共用
+  function activateMode(mode, sourceEl) {
+    document.querySelectorAll('.mode-tab').forEach((t) => t.classList.toggle('active', t === sourceEl))
+    // 收纳项激活时，让「⋯」按钮也高亮，提示"当前模块在收纳里"
+    const inMenu = !!document.querySelector(`.mode-more-item[data-mode="${mode}"]`)
+    if (moreBtn) moreBtn.classList.toggle('active', inMenu)
+    switchGameMode(mode)
+  }
+
+  document.querySelectorAll('.mode-tab[data-mode]').forEach((tab) => {
     tab.addEventListener('click', () => {
-      document.querySelectorAll('.mode-tab').forEach((t) => t.classList.toggle('active', t === tab));
-      switchGameMode(tab.dataset.mode);
-    });
-  });
-  // 默认井字棋（形象已隐藏）
-  const savedMode = ['gomoku', 'memo', 'draw', 'xiangqi', 'album'].includes(localStorage.getItem('companion.panelMode.v1'))
-    ? localStorage.getItem('companion.panelMode.v1')
-    : 'game';
-  localStorage.setItem('companion.panelMode.v1', savedMode);
-  // 延迟恢复默认模式：等所有模块（尤其象棋的 XQ）初始化完毕，避免 TDZ 报错
+      closeMore()
+      activateMode(tab.dataset.mode, tab)
+    })
+  })
+  document.querySelectorAll('.mode-more-item').forEach((item) => {
+    item.addEventListener('click', () => {
+      closeMore()
+      activateMode(item.dataset.mode, item)
+    })
+  })
+
+  // 默认打开五子棋（常用）
+  const VALID_MODES = ['game', 'gomoku', 'xiangqi', 'memo', 'draw', 'album', 'map', 'avatar']
+  const storedMode = localStorage.getItem('companion.panelMode.v1')
+  const savedMode = VALID_MODES.includes(storedMode) ? storedMode : 'gomoku'
+  localStorage.setItem('companion.panelMode.v1', savedMode)
+  // 延迟恢复：等模块初始化完（象棋引擎等），避免 TDZ
   setTimeout(() => {
-    document.querySelectorAll('.mode-tab').forEach((t) => {
-      if (t.dataset.mode === savedMode) t.click();
-    });
-  }, 0);
+    const direct = document.querySelector(`.mode-tab[data-mode="${savedMode}"]`)
+    const inMore = document.querySelector(`.mode-more-item[data-mode="${savedMode}"]`)
+    if (direct) activateMode(savedMode, direct)
+    else if (inMore) activateMode(savedMode, inMore)
+  }, 0)
 
   // ---------- 相册 ----------
   // 收藏珍贵图片 + 配文，可以指给她看、共同回忆。图片复用 images 目录。

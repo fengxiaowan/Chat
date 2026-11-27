@@ -69,6 +69,27 @@ body.has-chat-bg .companion-layout {
 .mode-tab:hover { background: rgba(0,0,0,.05); }
 .mode-tab.active { background: #fff; color: #333; border-color: #e2e2e2; }
 
+/* 收纳：不常用的模块折叠进「⋯」 */
+.mode-more { position: relative; }
+.mode-more-btn { font-size: 15px; letter-spacing: 1px; padding: 3px 11px; }
+.mode-more-btn.open { background: #fff; border-color: #e2e2e2; }
+.mode-more-menu {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 20;
+  display: flex; flex-direction: column; gap: 2px;
+  min-width: 132px; padding: 6px;
+  background: #fff; border: 1px solid #e2e2e2; border-radius: 10px;
+  box-shadow: 0 8px 22px rgba(60,50,40,.14);
+}
+.mode-more-menu[hidden] { display: none; }
+.mode-more-item {
+  border: 0; background: transparent; text-align: left;
+  font: inherit; font-size: 13px; color: #6d6060;
+  padding: 8px 10px; border-radius: 7px; cursor: pointer;
+  white-space: nowrap;
+}
+.mode-more-item:hover { background: rgba(0,0,0,.05); }
+.mode-more-item.active { background: #f6f2ea; color: #333; }
+
 /* 折叠形象后，聊天窗口居中放大 */
 .companion-layout.collapsed {
   justify-content: center;
@@ -457,6 +478,73 @@ header {
   white-space: pre-wrap; word-break: break-word;
 }
 .album-actions { display: flex; gap: 6px; justify-content: flex-end; }
+
+/* 散步纸 */
+.map-shell {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+  background: radial-gradient(circle at 50% 25%, #fffdf7 0%, #f8f2e5 60%, #efe7d6 100%);
+}
+.map-head { display: flex; align-items: center; gap: 6px; }
+.map-title { font-size: 15px; font-weight: 600; color: #5c5348; }
+.map-status { flex: 1; font-size: 12px; color: #a28b6f; text-align: right; }
+.map-status-error { color: #b5544a; }
+.map-btn {
+  border: 1px solid #e0d5c3; background: #fff; color: #6f6250;
+  width: 28px; height: 28px; border-radius: 6px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; font-size: 14px;
+}
+.map-btn:hover { background: #faf5ec; }
+.map-btn.on { background: #4a4238; color: #fdfbf6; border-color: #4a4238; }
+
+/* 纸张本身：地图画在它上面 */
+.map-paper {
+  position: relative; flex: 1 1 auto; min-height: 0;
+  border: 1px solid #e5d9c4; border-radius: 12px; overflow: hidden;
+  background: #f7f2e8;
+  box-shadow: inset 0 1px 6px rgba(120,105,80,.06);
+}
+#walkmap { position: absolute; inset: 0; }
+
+/* 迷雾层：整张纸盖住，只有走过的位置被擦开 */
+.walkmap-fog {
+  position: absolute; inset: 0; z-index: 2;
+  display: none; pointer-events: none;
+}
+
+/* 纸纹：极淡的颗粒，让画面不像屏幕 */
+.map-grain {
+  position: absolute; inset: 0; pointer-events: none; z-index: 3;
+  opacity: .30; mix-blend-mode: multiply;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='3'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.10'/%3E%3C/svg%3E");
+}
+
+/* 我的位置：小墨点 + 呼吸圈 */
+#walkmap-me {
+  position: absolute; z-index: 4; width: 12px; height: 12px;
+  margin: -6px 0 0 -6px; border-radius: 50%;
+  background: #3b3530; box-shadow: 0 0 0 2px rgba(59,53,48,.16);
+  pointer-events: none;
+}
+#walkmap-me::after {
+  content: ''; position: absolute; inset: -9px; border-radius: 50%;
+  border: 1px solid rgba(59,53,48,.24);
+  animation: walkmap-breathe 3.2s ease-in-out infinite;
+}
+@keyframes walkmap-breathe {
+  0%,100% { transform: scale(.75); opacity: .55; }
+  50%     { transform: scale(1.35); opacity: .12; }
+}
+
+.map-foot {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 11px; color: #9a8d78;
+}
+.map-credit { font-size: 10px; color: rgba(120,110,95,.7); }
 .avatar-badge {
   position: absolute;
   left: 12px;
@@ -957,6 +1045,13 @@ footer {
   .mode-tab::first-letter {
     font-size: 16px;
   }
+  /* 「⋯」和收纳菜单在手机上保持完整文字 */
+  .mode-more-btn { font-size: 15px !important; }
+  .mode-more-item {
+    font-size: 13px !important;
+    white-space: nowrap !important;
+  }
+  .mode-more-menu { left: auto; right: 0; }
 
   /* 移动端画板模式：画板内部紧凑化，画布尽量大 */
   .companion-layout:has(.draw-shell:not([hidden])) .draw-shell {

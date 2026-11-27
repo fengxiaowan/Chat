@@ -2233,6 +2233,7 @@ async function synthTts(text) {
 const ASSETS = {
   [`${BASE}/app.js`]: ['app.js', 'application/javascript; charset=utf-8'],
   [`${BASE}/map-demo.html`]: ['map-demo.html', 'text/html; charset=utf-8'],
+  [`${BASE}/walkmap.js`]: ['walkmap.js', 'application/javascript; charset=utf-8'],
   [`${BASE}/vendor/maplibre-gl.js`]: ['vendor/maplibre-gl.js', 'application/javascript; charset=utf-8'],
   [`${BASE}/vendor/maplibre-gl.css`]: ['vendor/maplibre-gl.css', 'text/css; charset=utf-8'],
   [`${BASE}/style.css`]: ['style.css', 'text/css; charset=utf-8'],
@@ -2265,16 +2266,28 @@ async function serveGet(request) {
     })
   }
   if (asset) {
-    return new Response(readFileSync(new URL(asset[0], ROOT)), {
+    const bytes = readFileSync(new URL(asset[0], ROOT))
+    // ETag：内容哈希。浏览器带着 If-None-Match 来问时，没变就返回 304，省流量又不跑旧代码。
+    const etag = '"' + createHash('sha1').update(bytes).digest('hex').slice(0, 20) + '"'
+    const inm = headerValue(request.headers, 'if-none-match')
+    if (inm && inm.split(',').map((s) => s.trim()).includes(etag)) {
+      return new Response(null, {
+        status: 304,
+        headers: { etag, 'cache-control': 'no-cache' },
+      })
+    }
+    return new Response(bytes, {
       headers: {
         'content-type': asset[1],
-        // 静态资源按内容版本号（index.html 里的 ?v=）长效缓存：刷新不再重新下载。
-        // app.js / style.css / vendor 都走 immutable，更新代码时改 index.html 的版本号即可。
+        etag,
+        // 只有「不会改」的大件（vendor 库 / 3D 模型）才做一年 immutable。
+        // 自己写的 app.js / style.css / walkmap.js 用 no-cache（靠 ETag 协商）：
+        // 一年多缓存 + 忘改版本号 = 手机上永远跑旧代码，这个坑踩过一次。
         'cache-control': path === `${BASE}/sw.js`
           ? 'no-cache'
-          : path.endsWith('.vrm') || path.endsWith('.js') || path.endsWith('.css')
+          : path.endsWith('.vrm') || path.includes('/vendor/')
             ? 'public, max-age=31536000, immutable'
-            : 'public, max-age=300, must-revalidate',
+            : 'no-cache',
         ...(path === `${BASE}/sw.js` ? { 'service-worker-allowed': BASE } : {}),
       },
     })

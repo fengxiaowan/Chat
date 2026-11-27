@@ -17,7 +17,8 @@
     color: #4a4238;
   }
 
-  #map { position: absolute; inset: 0; background: transparent; }
+  /* 不透明底：透明 WebGL 画布在截图/某些环境下会出现空图 */
+  #map { position: absolute; inset: 0; background: #f7f2e8; }
 
   /* 纸纹：一层极淡的颗粒，让画面不像屏幕 */
   .paper-grain {
@@ -114,15 +115,26 @@
       },
     },
     layers: [
-      { id: 'bg', type: 'background', paint: { 'background-color': 'rgba(0,0,0,0)' } },
+      // 纸底色直接由地图自己画：透明画布在部分环境（含 headless）会截出空图
+      { id: 'bg', type: 'background', paint: { 'background-color': '#f7f2e8' } },
 
-      // 水系：只描边
+      // 水系：先铺一层淡淡的蓝（河面/湖面），再描一道边
+      {
+        id: 'water-fill',
+        type: 'fill',
+        source: 'base',
+        'source-layer': 'water',
+        paint: {
+          'fill-color': 'rgba(150,186,206,0.42)',
+          'fill-outline-color': WATER,
+        },
+      },
       {
         id: 'water-line',
         type: 'line',
         source: 'base',
         'source-layer': 'water',
-        paint: { 'line-color': WATER, 'line-width': 1.2 },
+        paint: { 'line-color': WATER, 'line-width': 1 },
       },
       // 建筑：只描边，不填充（速写本里的房子轮廓）
       {

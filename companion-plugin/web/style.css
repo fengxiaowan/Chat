@@ -147,6 +147,7 @@ header {
 .game-head { display: flex; align-items: baseline; gap: 10px; }
 .game-title { font-size: 16px; font-weight: 600; color: #333; }
 .game-status { font-size: 12px; color: #9a7f7f; }
+.game-status.game-status-error { color: #c0392b; font-weight: 600; }
 .board {
   display: grid;
   grid-template-columns: repeat(3, 1fr);

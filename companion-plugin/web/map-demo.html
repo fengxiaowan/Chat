@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>散步纸 · demo</title>
+<link rel="stylesheet" href="/liao/vendor/maplibre-gl.css">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+
+  /* 纸底：不是白，是微微发暖的速写纸 */
+  body {
+    background:
+      radial-gradient(circle at 30% 20%, #fdfbf6 0%, #f7f2e8 55%, #efe8da 100%);
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: #4a4238;
+  }
+
+  #map { position: absolute; inset: 0; background: transparent; }
+
+  /* 纸纹：一层极淡的颗粒，让画面不像屏幕 */
+  .paper-grain {
+    position: absolute; inset: 0; pointer-events: none; z-index: 2;
+    opacity: .35; mix-blend-mode: multiply;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='3'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.10'/%3E%3C/svg%3E");
+  }
+
+  /* 我自己位置的标记：一个小墨点 + 一圈呼吸光 */
+  #me {
+    position: absolute; z-index: 5; width: 14px; height: 14px;
+    margin: -7px 0 0 -7px; border-radius: 50%;
+    background: #3b3530;
+    box-shadow: 0 0 0 2px rgba(59,53,48,.18);
+    pointer-events: none; transition: transform .25s ease;
+  }
+  #me::after {
+    content: ''; position: absolute; inset: -10px; border-radius: 50%;
+    border: 1px solid rgba(59,53,48,.25);
+    animation: breathe 3.2s ease-in-out infinite;
+  }
+  @keyframes breathe {
+    0%,100% { transform: scale(.75); opacity: .55; }
+    50%     { transform: scale(1.35); opacity: .12; }
+  }
+
+  .hud {
+    position: absolute; left: 16px; bottom: 16px; z-index: 6;
+    font-size: 12px; line-height: 1.7; color: #857a6a;
+    background: rgba(255,253,248,.82);
+    border: 1px solid rgba(180,168,148,.45);
+    border-radius: 10px; padding: 10px 12px;
+    backdrop-filter: blur(6px);
+    max-width: min(300px, 70vw);
+  }
+  .hud b { color: #4a4238; font-weight: 600; }
+  .hud .row { display: flex; justify-content: space-between; gap: 14px; }
+  .hud .err { color: #b5544a; }
+
+  .credit {
+    position: absolute; right: 8px; bottom: 6px; z-index: 6;
+    font-size: 10px; color: rgba(120,110,95,.7);
+  }
+
+  .topbar {
+    position: absolute; left: 50%; top: 14px; transform: translateX(-50%);
+    z-index: 6; display: flex; gap: 8px;
+  }
+  .topbar button {
+    font: inherit; font-size: 12px;
+    border: 1px solid rgba(180,168,148,.6);
+    background: rgba(255,253,248,.9);
+    color: #5d5348; border-radius: 999px; padding: 7px 14px; cursor: pointer;
+  }
+  .topbar button:hover { background: #fffdf8; }
+  .topbar button.on { background: #4a4238; color: #fdfbf6; border-color: #4a4238; }
+</style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="paper-grain"></div>
+  <div id="me" hidden></div>
+
+  <div class="topbar">
+    <button id="btn-locate">定位到我这</button>
+    <button id="btn-mask">试试迷雾</button>
+  </div>
+
+  <div class="hud">
+    <div class="row"><span>速度</span><b id="hud-speed">—</b></div>
+    <div class="row"><span>地图</span><b id="hud-state">载入中…</b></div>
+  </div>
+
+  <div class="credit">© OpenStreetMap · 数据来自 OpenFreeMap</div>
+
+<script src="/liao/vendor/maplibre-gl.js"></script>
+<script>
+(() => {
+  // ---------- 速写纸样式 ----------
+  // 目标：只有线条，没有填充色、没有路名、没有 POI 图标。
+  const INK = '#5a5148'
+  const INK_SOFT = 'rgba(90,81,72,0.45)'
+  const WATER = 'rgba(122,150,170,0.55)'
+  const style = {
+    version: 8,
+    // 纸本色，和 CSS 底色接近，让瓦片边缘不突兀
+    // 用透明让 CSS 的纸纹透出来
+    sources: {
+      base: {
+        type: 'vector',
+        tiles: ['https://tiles.openfreemap.org/backup_planet/20261122_124456_pt/{z}/{x}/{y}.pbf'],
+        minzoom: 0,
+        maxzoom: 14,
+      },
+    },
+    layers: [
+      { id: 'bg', type: 'background', paint: { 'background-color': 'rgba(0,0,0,0)' } },
+
+      // 水系：只描边
+      {
+        id: 'water-line',
+        type: 'line',
+        source: 'base',
+        'source-layer': 'water',
+        paint: { 'line-color': WATER, 'line-width': 1.2 },
+      },
+      // 建筑：只描边，不填充（速写本里的房子轮廓）
+      {
+        id: 'building-outline',
+        type: 'line',
+        source: 'base',
+        'source-layer': 'building',
+        paint: { 'line-color': INK_SOFT, 'line-width': 0.8 },
+      },
+      // 道路：主线粗一点，小路细
+      {
+        id: 'road-minor',
+        type: 'line',
+        source: 'base',
+        'source-layer': 'transportation',
+        filter: ['in', ['get', 'class'], ['literal', ['minor', 'service', 'path', 'track']]],
+        paint: { 'line-color': 'rgba(90,81,72,0.30)', 'line-width': 0.8 },
+      },
+      {
+        id: 'road-mid',
+        type: 'line',
+        source: 'base',
+        'source-layer': 'transportation',
+        filter: ['in', ['get', 'class'], ['literal', ['secondary', 'tertiary']]],
+        paint: { 'line-color': 'rgba(90,81,72,0.45)', 'line-width': 1.3 },
+      },
+      {
+        id: 'road-main',
+        type: 'line',
+        source: 'base',
+        'source-layer': 'transportation',
+        filter: ['in', ['get', 'class'], ['literal', ['primary', 'trunk', 'motorway']]],
+        paint: { 'line-color': INK, 'line-width': 2 },
+      },
+    ],
+  }
+
+  const map = new maplibregl.Map({
+    container: 'map',
+    style,
+    center: [117.18, 29.27],
+    zoom: 15,
+    attributionControl: false,
+    // 关掉所有默认 UI，保持"纸"的感觉
+    dragRotate: false,
+    pitchWithRotate: false,
+    touchZoomRotate: true,
+  })
+  window.__mapInst = map      // 便于诊断
+  map.touchZoomRotate.disableRotation()
+
+  const meEl = document.getElementById('me')
+  const speedEl = document.getElementById('hud-speed')
+  const stateEl = document.getElementById('hud-state')
+
+  map.on('load', () => { stateEl.textContent = '已就绪' })
+  map.on('error', (e) => {
+    const msg = (e && e.error && e.error.message) || '瓦片加载失败'
+    stateEl.textContent = msg.slice(0, 40)
+    stateEl.classList.add('err')
+  })
+
+  // ---------- 我自己在哪 ----------
+  let watchId = null
+  function placeMe(lng, lat) {
+    const p = map.project([lng, lat])
+    meEl.hidden = false
+    meEl.style.left = p.x + 'px'
+    meEl.style.top = p.y + 'px'
+  }
+  function clearMe() { meEl.hidden = true }
+
+  let last = null
+  function onPosition(pos) {
+    const { longitude, latitude, speed, accuracy } = pos.coords
+    placeMe(longitude, latitude)
+    speedEl.textContent = (speed != null && speed >= 0)
+      ? (speed * 3.6).toFixed(1) + ' km/h'
+      : '静止'
+    stateEl.textContent = `精度 ±${Math.round(accuracy)}m`
+    stateEl.classList.remove('err')
+    last = { longitude, latitude }
+  }
+  function onPosError(err) {
+    stateEl.textContent = '定位失败：' + (err.message || err.code)
+    stateEl.classList.add('err')
+  }
+
+  document.getElementById('btn-locate').addEventListener('click', () => {
+    if (!navigator.geolocation) { stateEl.textContent = '浏览器不支持定位'; return }
+    stateEl.textContent = '正在定位…'
+    navigator.geolocation.getCurrentPosition((pos) => {
+      onPosition(pos)
+      map.easeTo({ center: [pos.coords.longitude, pos.coords.latitude], zoom: 16, duration: 900 })
+      if (watchId == null) {
+        watchId = navigator.geolocation.watchPosition(onPosition, onPosError, {
+          enableHighAccuracy: true, maximumAge: 5000, timeout: 20000,
+        })
+      }
+    }, onPosError, { enableHighAccuracy: true, timeout: 20000 })
+  })
+
+  // 地图移动时，标记也要跟着走
+  map.on('move', () => { if (last) placeMe(last.longitude, last.latitude) })
+
+  // ---------- 迷雾小样 ----------
+  // 先做一个固定半径的"已探索"圆，看看擦开纸的效果。
+  let maskOn = false
+  document.getElementById('btn-mask').addEventListener('click', (e) => {
+    maskOn = !maskOn
+    e.target.classList.toggle('on', maskOn)
+    if (!last) { stateEl.textContent = '先点「定位到我这」'; return }
+    if (maskOn) {
+      const c = [last.longitude, last.latitude]
+      map.addSource('fog-hole', {
+        type: 'geojson',
+        data: { type: 'Feature', geometry: { type: 'Point', coordinates: c } },
+      })
+      // 用圆形遮罩的一圈柔和边界示意
+      map.addLayer({
+        id: 'fog-ring',
+        type: 'circle',
+        source: 'fog-hole',
+        paint: {
+          'circle-radius': 150,
+          'circle-color': 'rgba(247,242,232,0)',
+          'circle-stroke-color': 'rgba(90,81,72,0.18)',
+          'circle-stroke-width': 1,
+        },
+      })
+    } else {
+      if (map.getLayer('fog-ring')) map.removeLayer('fog-ring')
+      if (map.getSource('fog-hole')) map.removeSource('fog-hole')
+    }
+  })
+})()
+</script>
+</body>
+</html>

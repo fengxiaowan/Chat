@@ -454,7 +454,6 @@
     G.busy = true;
     renderBoard();
     try {
-      const image = drawBoardImage();
       const r = await fetch(BASE + '/game-move', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -462,7 +461,9 @@
           kind: G.kind,
           size: G.size,
           board: G.board,
-          image,
+          // 不再传整盘截图：棋盘状态已经在 board 里精确传了，
+          // 后端还会把棋面转成文字摘要。发图片会让官方 API 每步都去解析图像，
+          // 慢且容易超时，表现为下到一半卡住。中转站会忽略图片，所以那边反而正常。
           notes: S.notes,
           messages: S.history.slice(-S.limit),
         }),
@@ -480,8 +481,20 @@
         }
       }
       if (G.over) announceResult();
-    } catch {
+    } catch (err) {
       G.turn = 'user';
+      // 以前这里静默把回合还给你，看起来像「卡住」。
+      // 现在在棋盘上方明确说一句，你落下下一子她会自动重试。
+      if (gameStatusEl) {
+        gameStatusEl.textContent = '她这一步没接上（' + (err && err.message ? err.message : '超时') + '），你再落一子我重试';
+        gameStatusEl.classList.add('game-status-error');
+        setTimeout(() => {
+          if (gameStatusEl) {
+            gameStatusEl.textContent = '轮到你';
+            gameStatusEl.classList.remove('game-status-error');
+          }
+        }, 6000);
+      }
     } finally {
       G.busy = false;
       renderBoard();

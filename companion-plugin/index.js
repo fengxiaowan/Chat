@@ -33,6 +33,7 @@ const MEMOS_URL = new URL('./memos/', DATA_URL)
 const DRAWINGS_URL = new URL('./drawings/', DATA_URL)
 const ALBUMS_URL = new URL('./albums/', DATA_URL)
 const CHAT_BG_URL = new URL('chat-background.json', DATA_URL)
+const MAP_CACHE_URL = new URL('./map-cache/', DATA_URL)
 // 同一句语音可能同时被预取和播放请求命中。把生成任务合并，避免
 // 蜂窝网络抖动时重复启动 edge-tts，重复任务会互相抢带宽并延迟出声。
 const TTS_INFLIGHT = new Map()
@@ -228,6 +229,7 @@ function ensureDirs() {
   try { mkdirSync(MEMOS_URL, { recursive: true }) } catch {}
   try { mkdirSync(DRAWINGS_URL, { recursive: true }) } catch {}
   try { mkdirSync(ALBUMS_URL, { recursive: true }) } catch {}
+  try { mkdirSync(MAP_CACHE_URL, { recursive: true }) } catch {}
 }
 
 function safeId(id) {
@@ -613,6 +615,113 @@ async function drawingPost(req, res) {
   }
   writeJsonUrl(drawingUrl(id), drawing)
   return sendJson(res, 200, { ok: true, drawing })
+}
+
+// ---------- 散步地图：从 OSM 拉矢量地形，转成简笔画线稿 ----------
+// 定位：不是地图工具，是一张「走过才显现」的速写纸。
+// 只取 building / highway / waterway / bridge 四类，输出扁平坐标，方便前端画线。
+
+function mapCacheUrl(lat, lon, radius) {
+  const key = `${lat.toFixed(3)}_${lon.toFixed(3)}_${radius}`
+  return new URL(`${key}.json`, MAP_CACHE_URL)
+}
+
+// Overpass 在部分节点返回 406（缺 UA / 负载过重），多节点依次兜底
+const OVERPASS_NODES = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter',
+]
+
+async function fetchOverpass(query) {
+  let lastErr = ''
+  for (const node of OVERPASS_NODES) {
+    try {
+      const res = await fetch(node, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': 'xiaomiao-companion/1.0 (personal use)',
+          Accept: 'application/json',
+        },
+        body: 'data=' + encodeURIComponent(query),
+        signal: AbortSignal.timeout(60000),
+      })
+      if (!res.ok) { lastErr = `HTTP ${res.status} from ${node}`; continue }
+      const text = await res.text()
+      if (!text.trim().startsWith('{')) { lastErr = 'non-json from ' + node; continue }
+      return JSON.parse(text)
+    } catch (e) {
+      lastErr = String((e && e.message) || e)
+    }
+  }
+  throw new Error('地图数据获取失败：' + lastErr)
+}
+
+// 把 OSM 元素压成前端能直接画的线：[[lon,lat],...]
+function toMapShapes(obj, lat, lon) {
+  const shapes = { roads: [], buildings: [], water: [], bridges: [] }
+  const els = Array.isArray(obj && obj.elements) ? obj.elements : []
+  const norm = (geom) => (Array.isArray(geom) ? geom.map((p) => [Number(p.lon), Number(p.lat)]) : null)
+
+  for (const e of els) {
+    if (!e || !Array.isArray(e.geometry)) continue
+    const t = e.tags || {}
+    const line = norm(e.geometry)
+    if (!line || line.length < 2) continue
+    if (t.bridge === 'yes' || t.man_made === 'bridge') { shapes.bridges.push(line); continue }
+    if (t.waterway) { shapes.water.push(line); continue }
+    if (t.highway) {
+      // 主路更粗，小路更细；前端按键值区分线宽
+      const cls = t.highway === 'primary' || t.highway === 'trunk' ? 2
+        : t.highway === 'secondary' ? 1
+        : 0
+      shapes.roads.push({ line, cls })
+      continue
+    }
+    if (t.building) { shapes.buildings.push(line); continue }
+  }
+  return {
+    center: { lat, lon },
+    shapes,
+    count: { roads: shapes.roads.length, buildings: shapes.buildings.length, water: shapes.water.length, bridges: shapes.bridges.length },
+  }
+}
+
+async function mapData(url) {
+  const lat = Number(url.searchParams.get('lat'))
+  const lon = Number(url.searchParams.get('lon'))
+  const radius = Math.max(200, Math.min(Number(url.searchParams.get('r')) || 800, 2000))
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) {
+    return jsonResponse({ error: 'bad position' }, 400)
+  }
+
+  const cache = mapCacheUrl(lat, lon, radius)
+  if (url.searchParams.get('fresh') !== '1') {
+    const hit = readJsonUrl(cache, null)
+    if (hit) return jsonResponse({ ...hit, cached: true })
+  }
+
+  const query = `[out:json][timeout:60];
+(
+  way["building"](around:${radius},${lat},${lon});
+  way["highway"](around:${radius},${lat},${lon});
+  way["waterway"](around:${radius},${lat},${lon});
+  way["bridge"](around:${radius},${lat},${lon});
+);
+out geom;`
+
+  try {
+    const obj = await fetchOverpass(query)
+    const data = toMapShapes(obj, lat, lon)
+    try { writeJsonUrl(cache, { ...data, cachedAt: new Date().toISOString() }) } catch {}
+    return jsonResponse(data)
+  } catch (e) {
+    // 拉取失败时，尽量给上次缓存，别让页面白屏
+    const hit = readJsonUrl(cache, null)
+    if (hit) return jsonResponse({ ...hit, cached: true, stale: true })
+    return jsonResponse({ error: String((e && e.message) || e).slice(0, 200) }, 502)
+  }
 }
 
 // ---------- 相册：收藏珍贵图片 + 配文，共同回忆 ----------
@@ -2032,7 +2141,9 @@ function stripKaomoji(text) {
   const pairs = [['(', ')'], ['（', '）'], ['[', ']'], ['【', '】'], ['{', '}'], ['｛', '｝'], ['<', '>'], ['＜', '＞']]
   const esc = (ch) => ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   // 颜文字符号 = 不是「文字/数字/空白/普通标点/emoji」的字符
-  const KAO = /[^\p{L}\p{N}\s，。！？：；、""''「」『』《》（）()\[\]【】{}·\p{Emoji}\uFE0F\u200D]/u
+  const KAO = /[^\p{L}\p{N}\s，。！？：；、""''「」『』《》（）()\[\]【】{}·=+\-*\/%<>\p{Emoji}\uFE0F\u200D]/u
+  // 等号/无括号颜文字里的判定字符
+  const KAO0 = /[ωΩ・∀≧≦ﾟﾞ￣]/u
   // 常见颜文字尾巴字符（括号后面跟着的挥手/音符等）
   const TAIL = '[ノﾉヘ♪♫・∴∵وヾﾟﾞ￣]*'
   for (const [open, close] of pairs) {
@@ -2043,9 +2154,19 @@ function stripKaomoji(text) {
     })
   }
   // 删游离的孤立符号（保留 emoji）
-  s = s.replace(/[^\p{L}\p{N}\s，。！？：；、""''「」『』《》（）()\[\]【】{}\p{Emoji}\uFE0F\u200D]/gu, '')
+  s = s.replace(/[^\p{L}\p{N}\s，。！？：；、""''「」『』《》（）()\[\]【】{}=+\-*\/%<>\p{Emoji}\uFE0F\u200D]/gu, '')
+  // 等号颜文字里的带圈数字（=①ω①= 里的 ①）也不该念出来
+  s = s.replace(/[\u2460-\u24FF\u2776-\u2793]/g, '')
   // 删被空白包围的孤立尾巴字符
   s = s.replace(/(?:^|\s)[ノﾉヘ♪♫・∴∵وヾﾟﾞ￣]+(?=\s|$)/g, ' ')
+  // 等号包起来的颜文字：=｡･ω･｡= / =^･ω･^= / =①ω①= 这类。
+  // 只删「含颜文字特征字符」的等号段，普通数学式 a=b=c 原样保留。
+  s = s.replace(/=([^=]{0,20}?)=/g, (m, body) =>
+    (KAO0.test(body) || /[\uFF61-\uFF9F]/.test(body)) ? ' ' : m)
+  // 裸颜文字：｡･ω･｡ 这类没有等号/括号包裹的
+  s = s.replace(/[｡･]*[ωΩ][｡･]*/g, ' ')
+  // 兜底：任何残留的 ω / Ω 都会被念成"欧米伽"，直接去掉
+  s = s.replace(/[ωΩ]/g, '')
   s = s.replace(/[ ]{2,}/g, ' ').trim()
   return s
 }
@@ -2111,6 +2232,9 @@ async function synthTts(text) {
 
 const ASSETS = {
   [`${BASE}/app.js`]: ['app.js', 'application/javascript; charset=utf-8'],
+  [`${BASE}/map-demo.html`]: ['map-demo.html', 'text/html; charset=utf-8'],
+  [`${BASE}/vendor/maplibre-gl.js`]: ['vendor/maplibre-gl.js', 'application/javascript; charset=utf-8'],
+  [`${BASE}/vendor/maplibre-gl.css`]: ['vendor/maplibre-gl.css', 'text/css; charset=utf-8'],
   [`${BASE}/style.css`]: ['style.css', 'text/css; charset=utf-8'],
   [`${BASE}/sw.js`]: ['sw.js', 'application/javascript; charset=utf-8'],
   [`${BASE}/avatar.js`]: ['avatar.js', 'application/javascript; charset=utf-8'],
@@ -2158,6 +2282,9 @@ async function serveGet(request) {
   if (path === `${BASE}/info`) {
     const cfg = tune()
     return jsonResponse({ model: cfg.model, historyTurns: cfg.historyTurns })
+  }
+  if (path === `${BASE}/map-data`) {
+    return mapData(url)
   }
   if (path === `${BASE}/current`) {
     const thread = loadCurrent()
@@ -2996,7 +3123,6 @@ async function tictactoeMove(ctx, req, res, body) {
   const history = normMessages(body && body.messages).slice(-cfg.historyTurns)
   const { provider, model } = selection(ctx, cfg)
 
-  const image = typeof body.image === 'string' && body.image.startsWith('data:image/') ? body.image : ''
   const critical = criticalCell(board)
   const criticalHint = critical
     ? critical.kind === 'win'
@@ -3013,7 +3139,8 @@ async function tictactoeMove(ctx, req, res, body) {
   }).join('\n')
 
   const userContent = [{ type: 'text', text: `最近聊天：\n${recent}\n\n现在轮到你落子。` }]
-  if (image) userContent.push({ type: 'image_url', image_url: { url: image } })
+  // 井字棋不发棋盘截图：9 个格子的 board 和 boardToText 文字棋盘已经足够。
+  // 带图片会让官方接口每步解析图像，慢且易超时（中转站会忽略图片，反而正常）。
 
   const abort = new AbortController()
   req.on('close', () => abort.abort())
@@ -3077,7 +3204,6 @@ async function gomokuMove(ctx, req, res, body) {
   const memory = cleanNotes(body && body.notes)
   const history = normMessages(body && body.messages).slice(-cfg.historyTurns)
   const { provider, model } = selection(ctx, cfg)
-  const image = typeof body.image === 'string' && body.image.startsWith('data:image/') ? body.image : ''
 
   // 落子位置由规则引擎决定：保证分得清黑白、该堵会堵、该赢会赢。
   // 小喵只负责「心声」，不负责「算棋」，避免 LLM 在 15×15 上迷失。
@@ -3104,8 +3230,8 @@ async function gomokuMove(ctx, req, res, body) {
     return `${role}：${m.content}`
   }).join('\n')
   const userContent = [{ type: 'text', text: `最近聊天：\n${recent}\n\n现在轮到你落子。` }]
-  if (image) userContent.push({ type: 'image_url', image_url: { url: image } })
-
+  // 五子棋不传棋盘截图：board 数组 + gomokuBoardSummary 文字摘要已足够。
+  // 带图片会让官方接口每步解析图像，慢且易超时；中转站会忽略图片，所以那边反而正常。
   const abort = new AbortController()
   req.on('close', () => abort.abort())
   const fallbackMove = (index) => ({ x: Math.floor(index / size), y: index % size, index })

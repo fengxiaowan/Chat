@@ -61,6 +61,7 @@
     notes: 'companion.notes.v4',
     thread: 'companion.thread.v1',
     dropped: 'companion.dropped.v1',
+    regen: 'companion.regen.v1',
   };
   const EMPTY_NOTES = { about_you: [], how_to_talk: [], between_us: [], about_me: [] };
   // 本地缓存多少条：够翻一段历史，又不至于把 localStorage 撑爆
@@ -96,6 +97,49 @@
   //   busy:       正在重生成中
   // }
   const T = { round: null }
+
+  // 重生成状态持久化：刷新后只要最后一句是我说的、后面是她回的，
+  // 骰子就该还在——否则模型卡住非刷新不可时，重生成能力就丢了。
+  function saveRound() {
+    const r = T.round
+    if (!r || !r.userTs) { write(LS.regen, null); return }
+    write(LS.regen, {
+      userTs: r.userTs,
+      rejected: (r.rejected || []).slice(-3),
+      current: r.current || '',
+      attempt: r.attempt || 0,
+      text: r.text || '',
+    })
+  }
+  // 刷新后重建：用最后一条 user 消息，后面若只有 assistant 消息就算「可重生成的一轮」
+  function restoreRound() {
+    const saved = read(LS.regen, null)
+    const h = Array.isArray(S.history) ? S.history : []
+    // 从后往前找最后一条 user
+    let ui = -1
+    for (let i = h.length - 1; i >= 0; i--) {
+      if (h[i] && h[i].role === 'user') { ui = i; break }
+    }
+    if (ui < 0) return
+    const after = h.slice(ui + 1)
+    // 后面已经有新的 user 了，这一轮就不是最新的
+    if (after.some((m) => m && m.role === 'user')) return
+    const u = h[ui]
+    // 优先用存档里同一轮的记录（保留次数、被否版本）
+    const same = saved && String(saved.userTs) === String(u.ts) ? saved : null
+    T.round = {
+      userTs: u.ts,
+      startIndex: h.length,
+      rejected: same && Array.isArray(same.rejected) ? same.rejected.slice(-3) : [],
+      // 刷新后当前这版已完整落盘，直接算作「当前版本」
+      current: after.filter((m) => m && m.role === 'assistant').map((m) => m.content).join(''),
+      active: false,
+      attempt: same ? (Number(same.attempt) || 0) : 0,
+      busy: false,
+      text: same && same.text ? same.text : u.content,
+      images: u.imgs || u.img || null,
+    }
+  }
 
   // 被重生成替换掉的旧消息（ts+内容），用来让服务器真正删掉它们。
   // 只保留最近一小批，避免无限增长。
@@ -658,6 +702,110 @@
     if (direct) activateMode(savedMode, direct)
     else if (inMore) activateMode(savedMode, inMore)
   }, 0)
+
+  // ---------- 消息管理（勾选删除） ----------
+  // 右上角 🗑 进入管理模式：每条消息左边出现勾选框，输入栏变成「确定删除」。
+  // 删除会同时写墓碑（服务器 + 本地缓存），所以刷新也不会复活。
+  const DEL = { on: false, picked: new Set() }
+
+  function delEls() {
+    return {
+      bar: $('del-bar'),
+      count: $('del-count'),
+      confirm: $('del-confirm'),
+      send: $('send'),
+      input,
+      pic: $('pic'),
+      toggle: $('del-toggle'),
+    }
+  }
+
+  function enterDeleteMode() {
+    if (!S.history.length) { setStatus('还没有消息可以删', false); return }
+    DEL.on = true
+    DEL.picked.clear()
+    renderAll()
+    const e = delEls()
+    if (e.toggle) e.toggle.classList.add('on')
+    if (e.bar) e.bar.hidden = false
+    if (e.confirm) e.confirm.hidden = false
+    if (e.send) e.send.hidden = true
+    if (e.input) e.input.hidden = true
+    if (e.pic) e.pic.hidden = true
+    updateDelCount()
+    setStatus('勾选要删的消息，再点「确定删除」', false)
+  }
+
+  function exitDeleteMode() {
+    DEL.on = false
+    DEL.picked.clear()
+    renderAll()
+    const e = delEls()
+    if (e.toggle) e.toggle.classList.remove('on')
+    if (e.bar) e.bar.hidden = true
+    if (e.confirm) e.confirm.hidden = true
+    if (e.send) e.send.hidden = false
+    if (e.input) { e.input.hidden = false; e.input.focus() }
+    if (e.pic) e.pic.hidden = false
+    setStatus('', false)
+  }
+
+  function updateDelCount() {
+    const e = delEls()
+    if (e.count) e.count.textContent = String(DEL.picked.size)
+    if (e.confirm) e.confirm.disabled = DEL.picked.size === 0
+  }
+
+  function togglePick(ts) {
+    const k = String(ts)
+    if (DEL.picked.has(k)) DEL.picked.delete(k)
+    else DEL.picked.add(k)
+    const on = DEL.picked.has(k)
+    const row = list.querySelector(`.row[data-ts="${CSS.escape(k)}"]`)
+    if (row) {
+      row.classList.toggle('picked', on)
+      // 勾选框自己的视觉状态也要更新（之前只改了整行，框没变）
+      const box = row.querySelector('.pick-box')
+      if (box) box.classList.toggle('checked', on)
+    }
+    updateDelCount()
+  }
+
+  async function confirmDelete() {
+    if (!DEL.picked.size) return
+    const picked = S.history.filter((m) => m && DEL.picked.has(String(m.ts)))
+    if (!picked.length) return
+    if (!confirm(`删除选中的 ${picked.length} 条消息？删了就不会再出现（刷新也是）。`)) return
+    // 1. 写墓碑：服务器和本地缓存都不许再显示它们
+    for (const m of picked) S.dropped.push({ ts: m.ts, content: m.content })
+    if (S.dropped.length > 400) S.dropped = S.dropped.slice(-400)
+    // 2. 从历史里移除
+    S.history = S.history.filter((m) => !(m && DEL.picked.has(String(m.ts))))
+    DEL.picked.clear()
+    write(LS.hist, S.history.slice(-CACHE_MAX))
+    // 3. 立即落盘（带 dropped），服务器真正删除
+    await saveNow()
+    exitDeleteMode()
+    setStatus(`已删除 ${picked.length} 条`, false)
+    setTimeout(() => setStatus('', false), 2000)
+  }
+
+  // 绑定按钮
+  {
+    const e = delEls()
+    if (e.toggle && !e.toggle.dataset.bound) {
+      e.toggle.dataset.bound = '1'
+      e.toggle.addEventListener('click', () => { DEL.on ? exitDeleteMode() : enterDeleteMode() })
+    }
+    if (e.confirm && !e.confirm.dataset.bound) {
+      e.confirm.dataset.bound = '1'
+      e.confirm.addEventListener('click', confirmDelete)
+    }
+    for (const [id, fn] of [['del-cancel', exitDeleteMode]]) {
+      const b = $(id)
+      if (b && !b.dataset.bound) { b.dataset.bound = '1'; b.addEventListener('click', fn) }
+    }
+  }
 
   // ---------- 相册 ----------
   // 收藏珍贵图片 + 配文，可以指给她看、共同回忆。图片复用 images 目录。
@@ -2184,9 +2332,10 @@
     if (ts) row.dataset.ts = String(ts);
     const b = document.createElement('div');
     b.className = 'bubble';
-    // 引用入口：电脑悬停显示，手机长按触发
+    // 引用入口：电脑悬停显示，手机长按触发。
+    // 删除模式下不挂引用按钮，否则它会压在勾选框上。
     let qbtn = null;
-    if (role !== 'err' && text) {
+    if (role !== 'err' && text && !DEL.on) {
       qbtn = document.createElement('button');
       qbtn.type = 'button';
       qbtn.className = 'bubble-quote-btn';
@@ -2252,7 +2401,8 @@
         b.appendChild(t);
       }
     }
-    if (role === 'assistant') {
+    // 删除模式下不挂朗读，避免点一下既勾选又朗读
+    if (role === 'assistant' && !DEL.on) {
       b.classList.add('tts');
       b.title = '点击朗读 / 再点停止';
       b.addEventListener('click', () => toggleBubble(text, b));
@@ -2260,6 +2410,21 @@
     row.appendChild(b);
     // 引用按钮放在气泡内部，靠气泡定位，避免被 flex 推到窗口边缘
     if (qbtn) b.appendChild(qbtn);
+
+    // 删除模式：消息前面出现勾选框，点整行也能勾
+    if (DEL.on && role !== 'err' && ts) {
+      const cb = document.createElement('button')
+      cb.type = 'button'
+      cb.className = 'pick-box' + (DEL.picked.has(String(ts)) ? ' checked' : '')
+      cb.title = '选中这条'
+      cb.addEventListener('click', (e) => { e.stopPropagation(); togglePick(ts) })
+      row.insertBefore(cb, row.firstChild)
+      if (DEL.picked.has(String(ts))) row.classList.add('picked')
+      row.addEventListener('click', (e) => {
+        if (e.target.closest('.pick-box')) return
+        togglePick(ts)
+      })
+    }
     return row;
   }
   function addBubble(role, text, img, meta, ts) {
@@ -2444,7 +2609,7 @@
         if (S.done) {
           hideTyping()
           // 这一轮的气泡全部吐完，停止累积
-          if (T.round) T.round.active = false
+          if (T.round) { T.round.active = false; saveRound() }
           return
         }
         await waitWake();
@@ -2597,6 +2762,7 @@
       text: bubbleText,
       images,
     }
+    saveRound()
     renderRegenBtns()
     runTurn(bubbleText, false, images);
   }
@@ -2844,6 +3010,7 @@
     r.busy = true
     r.active = true
     r.current = ''
+    saveRound()
     renderRegenBtns()
     try {
       await runTurn(r.text, false, r.images, { rejected: r.rejected, regen: true })
@@ -3208,6 +3375,7 @@
     S.queue = []; S.idx = 0; S.done = true;
     S.history = [];
     T.round = null;   // 新对话：重生成状态一并清掉
+    saveRound();
     S.threadId = newId();
     S.title = '';
     S.createdAt = new Date().toISOString();
@@ -3873,6 +4041,7 @@
     if (ctrl) ctrl.abort();
     S.history = [];
     T.round = null;
+    saveRound();
     S.notes = normalizeNotes(EMPTY_NOTES);
     S.threadId = newId();
     S.title = '';
@@ -3929,6 +4098,8 @@
     S.notes = normalizeNotes(read(LS.notes, EMPTY_NOTES));
     S.threadId = localThread || newId();
     S.title = S.history.length ? titleOf(S.history) : '';
+    // 刷新后恢复「可重生成」状态：最后一句是我说的就有骰子
+    try { restoreRound() } catch {}
     renderAll();
     renderMem();
     autosize();
@@ -3975,6 +4146,8 @@
         write(LS.thread, S.threadId);
         write(LS.hist, S.history.slice(-CACHE_MAX));
         write(LS.notes, S.notes);
+        // 服务器数据到位后重建一次（本地缓存可能不完整）
+        try { restoreRound() } catch {}
         renderAll();
         renderMem();
       } else if (!painted) {

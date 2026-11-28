@@ -137,6 +137,7 @@
         <div class="actions">
           <button id="avatar-expand" class="gear" title="展开侧栏" hidden>ฅ</button>
           <button id="search" class="gear" title="搜索聊天记录">🔍</button>
+          <button id="del-toggle" class="gear" title="管理消息（勾选后删除）">🗑</button>
           <button id="new" class="gear" title="新对话">＋</button>
           <button id="gear" class="gear" title="设置">⚙</button>
         </div>
@@ -146,6 +147,12 @@
     <main id="list" class="list"></main>
 
     <footer>
+      <!-- 删除模式条：勾选消息时显示 -->
+      <div id="del-bar" class="del-bar" hidden>
+        <span>已选 <b id="del-count">0</b> 条</span>
+        <button id="del-cancel" class="del-btn">取消</button>
+      </div>
+
       <div id="quote-preview" class="quote-preview" hidden>
         <span class="quote-preview-text"></span>
         <button id="quote-preview-x" class="preview-x" title="移除">✕</button>
@@ -159,6 +166,7 @@
         <input id="file" type="file" accept="image/*" multiple hidden>
         <textarea id="input" rows="1" placeholder="说点什么…" autocomplete="off"></textarea>
         <button id="send" class="send">发送</button>
+        <button id="del-confirm" class="send del-confirm" hidden>确定删除</button>
       </div>
     </footer>
   </div>
